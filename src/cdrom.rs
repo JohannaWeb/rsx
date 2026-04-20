@@ -69,6 +69,11 @@ pub struct CdRomController {
     command_count: u64,
     dma_reads: u64,
     last_command: Option<CdRomCommand>,
+    // Queued second response delivered after the current interrupt is acknowledged
+    queued_irq: u8,
+    queued_response: Vec<u8>,
+    queued_data: Vec<u8>,
+    tick_counter: u32,
 }
 
 impl CdRomCommand {
@@ -298,6 +303,10 @@ impl CdRomController {
             command_count: 0,
             dma_reads: 0,
             last_command: None,
+            queued_irq: 0,
+            queued_response: Vec::new(),
+            queued_data: Vec::new(),
+            tick_counter: 0,
         }
     }
 
@@ -314,8 +323,17 @@ impl CdRomController {
         self.interrupt_flag & self.interrupt_enable & 0x1f != 0
     }
 
+    pub fn has_pending_response(&self) -> bool {
+        self.interrupt_flag & 0x1f != 0
+    }
+
+    pub fn pending_response(&self) -> Option<(u8, u8)> {
+        self.has_pending_response()
+            .then_some((self.interrupt_flag & 0x1f, self.response_fifo.first().copied().unwrap_or(0)))
+    }
+
     pub fn read8(&mut self, address: u32) -> u8 {
-        match address & 3 {
+        let value = match address & 3 {
             0 => self.status_byte(),
             1 => pop_front(&mut self.response_fifo),
             2 => pop_front(&mut self.data_fifo),
@@ -327,7 +345,15 @@ impl CdRomController {
                 }
             }
             _ => unreachable!(),
+        };
+        if std::env::var_os("PS1_TRACE_CDROM_READS").is_some() {
+            eprintln!(
+                "cdrom read addr={address:#010x} reg={} index={} value={value:#04x}",
+                address & 3,
+                self.index
+            );
         }
+        value
     }
 
     pub fn read_data_byte(&mut self) -> u8 {
@@ -343,6 +369,31 @@ impl CdRomController {
         self.dma_reads
     }
 
+    pub fn tick(&mut self) {
+        if self.tick_counter > 0 {
+            self.tick_counter -= 1;
+            if self.tick_counter == 0 && self.queued_irq != 0 {
+                // Only deliver if the previous interrupt was acknowledged
+                if self.interrupt_flag == 0 {
+                    self.response_fifo.clear();
+                    self.response_fifo
+                        .extend_from_slice(&self.queued_response.clone());
+                    if !self.queued_data.is_empty() {
+                        self.data_fifo.clear();
+                        self.data_fifo.extend_from_slice(&self.queued_data.clone());
+                    }
+                    self.interrupt_flag = self.queued_irq;
+                    self.queued_irq = 0;
+                    self.queued_response.clear();
+                    self.queued_data.clear();
+                } else {
+                    // Try again next tick if still busy
+                    self.tick_counter = 1;
+                }
+            }
+        }
+    }
+
     pub fn debug_state(&self) -> CdRomDebugState {
         CdRomDebugState {
             last_command: self.last_command,
@@ -356,6 +407,13 @@ impl CdRomController {
     }
 
     pub fn write8(&mut self, address: u32, value: u8) {
+        if std::env::var_os("PS1_TRACE_CDROM_WRITES").is_some() {
+            eprintln!(
+                "cdrom write addr={address:#010x} reg={} index={} value={value:#04x}",
+                address & 3,
+                self.index
+            );
+        }
         match address & 3 {
             0 => self.index = value & 3,
             1 => {
@@ -373,8 +431,11 @@ impl CdRomController {
                     if value & 0x80 != 0 {
                         self.parameter_fifo.clear();
                     }
+
                 }
-                1 => self.interrupt_flag &= !(value & 0x1f),
+                1 => {
+                    self.interrupt_flag &= !(value & 0x1f);
+                }
                 _ => {}
             },
             _ => unreachable!(),
@@ -412,13 +473,25 @@ impl CdRomController {
             CdRomCommand::GetStat => self.complete_with_status(),
             CdRomCommand::Setloc => self.setloc(),
             CdRomCommand::ReadN | CdRomCommand::ReadS => self.read_sector(),
-            CdRomCommand::MotorOn
-            | CdRomCommand::Init
-            | CdRomCommand::SeekL
-            | CdRomCommand::SeekP => self.complete_with_status(),
-            CdRomCommand::Stop | CdRomCommand::Pause => {
+            // These commands send INT3 (ack) then INT2 (complete)
+            CdRomCommand::MotorOn | CdRomCommand::SeekL | CdRomCommand::SeekP => {
+                let stat = self.status;
+                self.push_ack_then(&[stat], 0x02);
+            }
+            CdRomCommand::Init => {
+                self.status = 0x02;
+                let stat = self.status;
+                self.push_ack_then(&[stat], 0x02);
+            }
+            CdRomCommand::Stop => {
                 self.status = 0x00;
-                self.complete_with_status();
+                let stat = self.status;
+                self.push_ack_then(&[stat], 0x02);
+            }
+            CdRomCommand::Pause => {
+                self.status &= !0x20; // clear reading bit
+                let stat = self.status;
+                self.push_ack_then(&[stat], 0x02);
             }
             CdRomCommand::Mute | CdRomCommand::Demute => self.complete_with_status(),
             CdRomCommand::Setfilter => {
@@ -463,7 +536,14 @@ impl CdRomController {
                 self.status = 0x22;
             }
         }
-        self.complete_with_status();
+        // INT3 (ack) first, then INT1 (data ready) — data is pre-loaded into data_fifo
+        let stat = self.status;
+        self.response_fifo.clear();
+        self.response_fifo.push(stat);
+        self.interrupt_flag = 0x03;
+        self.queued_irq = 0x01;
+        self.queued_response = vec![stat];
+        self.tick_counter = 50000;
     }
 
     fn get_td(&mut self) {
@@ -497,11 +577,32 @@ impl CdRomController {
     }
 
     fn get_id(&mut self) {
-        self.push_response(&[self.status, 0x00, 0x20, 0x00, b'S', b'C', b'E', b'A']);
+        // INT3 (ack) first with status only, then INT2 with the full 8-byte response
+        let stat = self.status;
+        self.response_fifo.clear();
+        self.response_fifo.push(stat);
+        self.interrupt_flag = 0x03;
+
+        self.queued_irq = 0x02;
+        self.queued_response = vec![stat, 0x00, 0x20, 0x00, b'S', b'C', b'E', b'A'];
+        self.tick_counter = 50000;
     }
 
     fn complete_with_status(&mut self) {
-        self.push_response(&[self.status]);
+        self.push_ack_then(&[self.status], 0);
+    }
+
+    // INT3 ack with [stat], then optionally a second response with irq2/bytes2
+    fn push_ack_then(&mut self, second_bytes: &[u8], second_irq: u8) {
+        log::debug!("CD-ROM ack INT3, queuing IRQ {second_irq} response: {second_bytes:02x?}");
+        self.response_fifo.clear();
+        self.response_fifo.push(self.status);
+        self.interrupt_flag = 0x03;
+        if second_irq != 0 {
+            self.queued_irq = second_irq;
+            self.queued_response = second_bytes.to_vec();
+            self.tick_counter = 50000;
+        }
     }
 
     fn push_response(&mut self, bytes: &[u8]) {
@@ -630,26 +731,32 @@ fn read_le_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 fn parse_cue(cue: &str) -> Result<(String, TrackMode)> {
-    let mut file = None;
-    let mut mode = None;
+    let mut current_file = None;
 
     for line in cue.lines().map(str::trim) {
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("FILE ") {
-            file = Some(parse_quoted_file(line)?);
+            current_file = Some(parse_quoted_file(line)?);
         } else if upper.starts_with("TRACK ") {
-            if upper.contains("MODE1/2352") {
-                mode = Some(TrackMode::Mode1Raw);
+            let mode = if upper.contains("MODE1/2352") {
+                Some(TrackMode::Mode1Raw)
             } else if upper.contains("MODE2/2352") {
-                mode = Some(TrackMode::Mode2Raw);
+                Some(TrackMode::Mode2Raw)
+            } else {
+                None
+            };
+
+            if let Some(mode) = mode {
+                let file = current_file
+                    .ok_or_else(|| Error::InvalidCue("TRACK entry has no FILE entry".into()))?;
+                return Ok((file, mode));
             }
         }
     }
 
-    let file = file.ok_or_else(|| Error::InvalidCue("missing FILE entry".into()))?;
-    let mode =
-        mode.ok_or_else(|| Error::InvalidCue("missing MODE1/2352 or MODE2/2352 track".into()))?;
-    Ok((file, mode))
+    Err(Error::InvalidCue(
+        "missing MODE1/2352 or MODE2/2352 track".into(),
+    ))
 }
 
 fn parse_quoted_file(line: &str) -> Result<String> {
@@ -675,6 +782,16 @@ mod tests {
         let (file, mode) = parse_cue(cue).unwrap();
 
         assert_eq!(file, "game.bin");
+        assert_eq!(mode, TrackMode::Mode2Raw);
+    }
+
+    #[test]
+    fn parses_first_data_track_from_multifile_cue() {
+        let cue = "FILE \"data.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n";
+
+        let (file, mode) = parse_cue(cue).unwrap();
+
+        assert_eq!(file, "data.bin");
         assert_eq!(mode, TrackMode::Mode2Raw);
     }
 

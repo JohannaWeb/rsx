@@ -7,7 +7,9 @@ mod dma;
 mod ecm;
 mod error;
 mod exe;
+mod gte;
 mod gpu;
+mod spu;
 
 pub use bios::Bios;
 pub use bus::Bus;

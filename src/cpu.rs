@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::bus::Bus;
 use crate::error::{Error, Result};
+use crate::gte::Gte;
 
 const BIOS_RESET_VECTOR: u32 = 0xbfc0_0000;
 const EXCEPTION_VECTOR: u32 = 0x8000_0080;
@@ -10,13 +11,25 @@ const COP0_CAUSE: usize = 13;
 const COP0_EPC: usize = 14;
 const COP0_STATUS_INTERRUPT_ENABLE: u32 = 1;
 const COP0_STATUS_INTERRUPT_MASK_SHIFT: u32 = 8;
+const COP0_STATUS_IM2: u32 = 1 << 10;
+const COP0_STATUS_EXCEPTION_STACK_MASK: u32 = 0x3f;
+const COP0_STATUS_CRITICAL_SECTION_MASK: u32 = COP0_STATUS_IM2 | COP0_STATUS_INTERRUPT_ENABLE;
 const COP0_CAUSE_INTERRUPT_PENDING_SHIFT: u32 = 8;
 const BIOS_CALL_A0: u32 = 0x0000_00a0;
 const BIOS_CALL_B0: u32 = 0x0000_00b0;
 const BIOS_CALL_C0: u32 = 0x0000_00c0;
 const BIOS_HEAP_START: u32 = 0x8001_0000;
 const BIOS_A_MALLOC: u32 = 0x33;
+const BIOS_A_WRITE: u32 = 0x03;
+const BIOS_A_ISATTY: u32 = 0x07;
 const BIOS_B_ALLOC_KERNEL_MEMORY: u32 = 0x00;
+const BIOS_B_RETURN_FROM_EXCEPTION: u32 = 0x17;
+const BIOS_B_RESET_ENTRY_INT: u32 = 0x18;
+const BIOS_B_HOOK_ENTRY_INT: u32 = 0x19;
+const BIOS_B_WRITE: u32 = 0x35;
+const BIOS_B_ISATTY: u32 = 0x39;
+const SYS_ENTER_CRITICAL_SECTION: u32 = 0x01;
+const SYS_EXIT_CRITICAL_SECTION: u32 = 0x02;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +51,7 @@ enum PrimaryOpcode {
     Xori = 0x0e,
     Lui = 0x0f,
     Cop0 = 0x10,
+    Cop2 = 0x12,
     Lb = 0x20,
     Lh = 0x21,
     Lwl = 0x22,
@@ -50,6 +64,8 @@ enum PrimaryOpcode {
     Swl = 0x2a,
     Sw = 0x2b,
     Swr = 0x2e,
+    Lwc2 = 0x32,
+    Swc2 = 0x3a,
 }
 
 #[repr(u8)]
@@ -63,6 +79,7 @@ enum SpecialOpcode {
     Srav = 0x07,
     Jr = 0x08,
     Jalr = 0x09,
+    Break = 0x0d,
     Syscall = 0x0c,
     Mfhi = 0x10,
     Mthi = 0x11,
@@ -107,11 +124,41 @@ enum Cop0FunctionOpcode {
     Rfe = 0x10,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cop2RsOpcode {
+    Mfc2 = 0x00,
+    Cfc2 = 0x02,
+    Mtc2 = 0x04,
+    Ctc2 = 0x06,
+}
+
+impl Cop2RsOpcode {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0x00 => Some(Self::Mfc2),
+            0x02 => Some(Self::Cfc2),
+            0x04 => Some(Self::Mtc2),
+            0x06 => Some(Self::Ctc2),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BiosCallVector {
     A0,
     B0,
     C0,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InterruptHook {
+    pc: u32,
+    sp: u32,
+    fp: u32,
+    saved: [u32; 8],
+    gp: u32,
 }
 
 type InstructionHandler = fn(&mut Cpu, u32, u32, &mut Bus) -> Result<()>;
@@ -135,6 +182,7 @@ const PRIMARY_OPCODE_TABLE: [InstructionHandler; 64] = {
     table[PrimaryOpcode::Xori as usize] = Cpu::op_xori;
     table[PrimaryOpcode::Lui as usize] = Cpu::op_lui;
     table[PrimaryOpcode::Cop0 as usize] = Cpu::op_cop0;
+    table[PrimaryOpcode::Cop2 as usize] = Cpu::op_cop2;
     table[PrimaryOpcode::Lb as usize] = Cpu::op_lb;
     table[PrimaryOpcode::Lh as usize] = Cpu::op_lh;
     table[PrimaryOpcode::Lwl as usize] = Cpu::op_lwl;
@@ -147,6 +195,8 @@ const PRIMARY_OPCODE_TABLE: [InstructionHandler; 64] = {
     table[PrimaryOpcode::Swl as usize] = Cpu::op_swl;
     table[PrimaryOpcode::Sw as usize] = Cpu::op_sw;
     table[PrimaryOpcode::Swr as usize] = Cpu::op_swr;
+    table[PrimaryOpcode::Lwc2 as usize] = Cpu::op_lwc2;
+    table[PrimaryOpcode::Swc2 as usize] = Cpu::op_swc2;
     table
 };
 
@@ -160,6 +210,7 @@ const SPECIAL_FUNCTION_TABLE: [InstructionHandler; 64] = {
     table[SpecialOpcode::Srav as usize] = Cpu::special_srav;
     table[SpecialOpcode::Jr as usize] = Cpu::special_jr;
     table[SpecialOpcode::Jalr as usize] = Cpu::special_jalr;
+    table[SpecialOpcode::Break as usize] = Cpu::special_break;
     table[SpecialOpcode::Syscall as usize] = Cpu::special_syscall;
     table[SpecialOpcode::Mfhi as usize] = Cpu::special_mfhi;
     table[SpecialOpcode::Mthi as usize] = Cpu::special_mthi;
@@ -221,11 +272,15 @@ impl BiosCallVector {
 pub struct Cpu {
     regs: [u32; 32],
     cop0: [u32; 32],
+    gte: Gte,
     hi: u32,
     lo: u32,
     pc: u32,
     next_pc: u32,
     bios_heap: u32,
+    interrupt_hook: Option<InterruptHook>,
+    interrupt_return_pc: Option<u32>,
+    interrupt_saved_registers: Option<([u32; 32], u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,11 +303,15 @@ impl Cpu {
         Self {
             regs: [0; 32],
             cop0: [0; 32],
+            gte: Gte::new(),
             hi: 0,
             lo: 0,
             pc: BIOS_RESET_VECTOR,
             next_pc: BIOS_RESET_VECTOR + 4,
             bios_heap: BIOS_HEAP_START,
+            interrupt_hook: None,
+            interrupt_return_pc: None,
+            interrupt_saved_registers: None,
         }
     }
 
@@ -287,12 +346,12 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<()> {
         if let Some(vector) = BiosCallVector::decode(self.pc) {
-            self.execute_bios_call(vector);
+            self.execute_bios_call(vector, bus);
             return Ok(());
         }
 
         if let Some(cause) = self.pending_interrupt_cause(bus) {
-            self.enter_exception(self.pc, cause);
+            self.enter_interrupt(self.pc, cause, bus);
             return Ok(());
         }
 
@@ -337,6 +396,39 @@ impl Cpu {
 
     fn op_cop0(&mut self, pc: u32, instruction: u32, bus: &mut Bus) -> Result<()> {
         self.execute_cop0(pc, instruction, bus)
+    }
+
+    fn op_cop2(&mut self, _pc: u32, instruction: u32, _bus: &mut Bus) -> Result<()> {
+        let rs_val = ((instruction >> 21) & 0x1f) as u8;
+        let rt = ((instruction >> 16) & 0x1f) as usize;
+        let rd = ((instruction >> 11) & 0x1f) as usize;
+        if instruction & (1 << 25) != 0 {
+            self.gte.execute(instruction);
+        } else if let Some(opcode) = Cop2RsOpcode::from_u8(rs_val) {
+            match opcode {
+                Cop2RsOpcode::Mfc2 => self.set_reg(rt, self.gte.read_data(rd)),
+                Cop2RsOpcode::Cfc2 => self.set_reg(rt, self.gte.read_ctrl(rd)),
+                Cop2RsOpcode::Mtc2 => self.gte.write_data(rd, self.reg(rt)),
+                Cop2RsOpcode::Ctc2 => self.gte.write_ctrl(rd, self.reg(rt)),
+            }
+        }
+        Ok(())
+    }
+
+    fn op_lwc2(&mut self, _pc: u32, instruction: u32, bus: &mut Bus) -> Result<()> {
+        let base = ((instruction >> 21) & 0x1f) as usize;
+        let rt = ((instruction >> 16) & 0x1f) as usize;
+        let address = self.reg(base).wrapping_add(instruction as i16 as u32);
+        let value = bus.read32(address)?;
+        self.gte.write_data(rt, value);
+        Ok(())
+    }
+
+    fn op_swc2(&mut self, _pc: u32, instruction: u32, bus: &mut Bus) -> Result<()> {
+        let base = ((instruction >> 21) & 0x1f) as usize;
+        let rt = ((instruction >> 16) & 0x1f) as usize;
+        let address = self.reg(base).wrapping_add(instruction as i16 as u32);
+        bus.write32(address, self.gte.read_data(rt))
     }
 
     fn op_j(&mut self, pc: u32, instruction: u32, _bus: &mut Bus) -> Result<()> {
@@ -563,7 +655,25 @@ impl Cpu {
         Ok(())
     }
 
+    fn special_break(&mut self, _pc: u32, _instruction: u32, _bus: &mut Bus) -> Result<()> {
+        // For now, treat BREAK as a NOP to avoid crashing the emulator.
+        // On real hardware, this would trigger an exception.
+        Ok(())
+    }
+
     fn special_syscall(&mut self, _pc: u32, _instruction: u32, _bus: &mut Bus) -> Result<()> {
+        match self.regs[4] {
+            SYS_ENTER_CRITICAL_SECTION => {
+                let status = self.cop0[COP0_STATUS];
+                self.regs[2] = u32::from(status & COP0_STATUS_CRITICAL_SECTION_MASK == COP0_STATUS_CRITICAL_SECTION_MASK);
+                self.cop0[COP0_STATUS] = status & !COP0_STATUS_CRITICAL_SECTION_MASK;
+            }
+            SYS_EXIT_CRITICAL_SECTION => {
+                self.regs[2] = 1;
+                self.cop0[COP0_STATUS] |= COP0_STATUS_CRITICAL_SECTION_MASK;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -718,7 +828,7 @@ impl Cpu {
     fn cop0_co(&mut self, pc: u32, instruction: u32, bus: &mut Bus) -> Result<()> {
         if (instruction & 0x3f) == Cop0FunctionOpcode::Rfe as u32 {
             let status = self.cop0[COP0_STATUS];
-            self.cop0[COP0_STATUS] = (status & !0x3f) | ((status >> 2) & 0x0f);
+            self.cop0[COP0_STATUS] = (status & !COP0_STATUS_EXCEPTION_STACK_MASK) | ((status >> 2) & (COP0_STATUS_EXCEPTION_STACK_MASK >> 2));
             Ok(())
         } else {
             self.op_unsupported(pc, instruction, bus)
@@ -741,22 +851,60 @@ impl Cpu {
         (active != 0).then_some(active << COP0_CAUSE_INTERRUPT_PENDING_SHIFT)
     }
 
-    fn enter_exception(&mut self, pc: u32, cause: u32) {
+    fn enter_interrupt(&mut self, pc: u32, cause: u32, bus: &Bus) {
+        if std::env::var_os("PS1_TRACE_INTERRUPTS").is_some() {
+            eprintln!(
+                "interrupt pc={pc:#010x} next_pc={:#010x} instr={:#010x} cause={cause:#010x} hook={:?} ra={:#010x}",
+                self.next_pc,
+                bus.peek32(pc).unwrap_or(0),
+                self.interrupt_hook,
+                self.regs[31]
+            );
+        }
         self.cop0[COP0_EPC] = pc;
         self.cop0[COP0_CAUSE] = cause;
         let status = self.cop0[COP0_STATUS];
-        self.cop0[COP0_STATUS] = (status & !0x3f) | ((status << 2) & 0x3f);
-        self.pc = EXCEPTION_VECTOR;
-        self.next_pc = EXCEPTION_VECTOR + 4;
+        self.cop0[COP0_STATUS] = (status & !COP0_STATUS_EXCEPTION_STACK_MASK) | ((status << 2) & COP0_STATUS_EXCEPTION_STACK_MASK);
+        if let Some(hook) = self.interrupt_hook {
+            self.regs[2] = 1;
+            self.regs[16..24].copy_from_slice(&hook.saved);
+            self.regs[28] = hook.gp;
+            self.regs[29] = hook.sp;
+            self.regs[30] = hook.fp;
+            self.regs[31] = hook.pc;
+            self.pc = hook.pc;
+            self.next_pc = hook.pc.wrapping_add(4);
+        } else {
+            self.pc = EXCEPTION_VECTOR;
+            self.next_pc = EXCEPTION_VECTOR + 4;
+        }
     }
 
-    fn execute_bios_call(&mut self, vector: BiosCallVector) {
+    fn execute_bios_call(&mut self, vector: BiosCallVector, bus: &mut Bus) {
         match (vector, self.regs[9]) {
             (BiosCallVector::A0, BIOS_A_MALLOC) => {
                 self.allocate_bios_heap(self.regs[4]);
             }
             (BiosCallVector::B0, BIOS_B_ALLOC_KERNEL_MEMORY) => {
                 self.allocate_bios_heap(self.regs[4]);
+            }
+            (BiosCallVector::B0, BIOS_B_RETURN_FROM_EXCEPTION) => {
+                self.return_from_exception();
+                return;
+            }
+            (BiosCallVector::B0, BIOS_B_RESET_ENTRY_INT) => {
+                self.interrupt_hook = None;
+            }
+            (BiosCallVector::B0, BIOS_B_HOOK_ENTRY_INT) => {
+                let _ = bus;
+                self.interrupt_hook = None;
+            }
+            (BiosCallVector::A0, BIOS_A_WRITE) | (BiosCallVector::B0, BIOS_B_WRITE) => {
+                trace_tty_write(bus, self.regs[5], self.regs[6]);
+                self.regs[2] = self.regs[6];
+            }
+            (BiosCallVector::A0, BIOS_A_ISATTY) | (BiosCallVector::B0, BIOS_B_ISATTY) => {
+                self.regs[2] = 1;
             }
             _ => {}
         }
@@ -770,6 +918,25 @@ impl Cpu {
         let size = align_up(size, 4);
         self.regs[2] = self.bios_heap;
         self.bios_heap = self.bios_heap.wrapping_add(size);
+    }
+
+    fn return_from_exception(&mut self) {
+        let status = self.cop0[COP0_STATUS];
+        self.cop0[COP0_STATUS] = (status & !COP0_STATUS_EXCEPTION_STACK_MASK) | ((status >> 2) & (COP0_STATUS_EXCEPTION_STACK_MASK >> 2));
+        let return_address = self.interrupt_return_pc.take().unwrap_or(self.cop0[COP0_EPC]);
+        if std::env::var_os("PS1_TRACE_INTERRUPTS").is_some() {
+            eprintln!(
+                "return interrupt pc={return_address:#010x} epc={:#010x}",
+                self.cop0[COP0_EPC]
+            );
+        }
+        if let Some((regs, hi, lo)) = self.interrupt_saved_registers.take() {
+            self.regs = regs;
+            self.hi = hi;
+            self.lo = lo;
+        }
+        self.pc = return_address;
+        self.next_pc = return_address.wrapping_add(4);
     }
 }
 
@@ -869,6 +1036,41 @@ fn store_word_right(bus: &mut Bus, address: u32, value: u32) -> Result<()> {
 
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+fn trace_tty_write(bus: &mut Bus, address: u32, length: u32) {
+    if std::env::var_os("PS1_TRACE_TTY").is_none() || length == 0 {
+        return;
+    }
+
+    let mut text = String::new();
+    for offset in 0..length.min(1024) {
+        let byte = bus.read8(address.wrapping_add(offset)).unwrap_or(b'?');
+        let ch = match byte {
+            b'\n' | b'\r' | b'\t' => byte as char,
+            0x20..=0x7e => byte as char,
+            _ => '.',
+        };
+        text.push(ch);
+    }
+    eprint!("{text}");
+}
+
+fn read_interrupt_hook(bus: &mut Bus, address: u32) -> Option<InterruptHook> {
+    let mut saved = [0; 8];
+    for (index, value) in saved.iter_mut().enumerate() {
+        *value = bus
+            .read32(address.wrapping_add(0x0c + (index as u32 * 4)))
+            .ok()?;
+    }
+
+    Some(InterruptHook {
+        pc: bus.read32(address).ok()?,
+        sp: bus.read32(address.wrapping_add(0x04)).ok()?,
+        fp: bus.read32(address.wrapping_add(0x08)).ok()?,
+        saved,
+        gp: bus.read32(address.wrapping_add(0x2c)).ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -1033,14 +1235,31 @@ mod tests {
     }
 
     #[test]
-    fn syscall_is_currently_treated_as_noop() {
+    fn syscall_exit_critical_section_enables_interrupts() {
         let mut cpu = Cpu::new();
         cpu.set_pc(0);
         let mut bus = bus_with_program(&[SpecialOpcode::Syscall as u32]);
+        cpu.set_reg(4, SYS_EXIT_CRITICAL_SECTION);
 
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.state().pc, 4);
+        assert_eq!(cpu.cop0[COP0_STATUS] & 0x0000_0401, 0x0000_0401);
+        assert_eq!(cpu.state().regs[2], 1);
+    }
+
+    #[test]
+    fn syscall_enter_critical_section_disables_interrupts() {
+        let mut cpu = Cpu::new();
+        cpu.set_pc(0);
+        cpu.cop0[COP0_STATUS] = 0x0000_0401;
+        let mut bus = bus_with_program(&[SpecialOpcode::Syscall as u32]);
+        cpu.set_reg(4, SYS_ENTER_CRITICAL_SECTION);
+
+        cpu.step(&mut bus).unwrap();
+
+        assert_eq!(cpu.cop0[COP0_STATUS] & 0x0000_0401, 0);
+        assert_eq!(cpu.state().regs[2], 1);
     }
 
     #[test]

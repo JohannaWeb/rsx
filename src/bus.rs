@@ -3,6 +3,7 @@ use crate::cdrom::{CdImage, CdRomController, CdRomDebugState};
 use crate::dma::{DmaChannel, DmaController, DmaDirection, DmaStep, DmaSyncMode, DmaTransfer};
 use crate::error::{Error, Result};
 use crate::gpu::{Gpu, GpuDebugState};
+use crate::spu::Spu;
 
 pub const RAM_SIZE: usize = 2 * 1024 * 1024;
 const SCRATCHPAD_SIZE: usize = 1024;
@@ -22,6 +23,8 @@ const DMA_BASE: u32 = 0x1f80_1080;
 const DMA_END: u32 = 0x1f80_1100;
 const CDROM_BASE: u32 = 0x1f80_1800;
 const CDROM_END: u32 = CDROM_BASE + 4;
+const SPU_BASE: u32 = 0x1f80_1c00;
+const SPU_END: u32 = 0x1f80_2000;
 const GPU_GP0: u32 = 0x1f80_1810;
 const GPU_GP1: u32 = 0x1f80_1814;
 const GPU_END: u32 = GPU_GP1 + 4;
@@ -31,6 +34,10 @@ const VBLANK_INTERRUPT_BIT: u32 = 1;
 const CDROM_INTERRUPT_BIT: u32 = 1 << 2;
 pub(crate) const VBLANK_INTERVAL_TICKS: u32 = 33_868;
 const PSYQ_CD_SYNC_FLAG_ADDRESS: u32 = 0x8008_9d9c;
+const PSYQ_CD_REG0: u32 = 0x1f80_1800;
+const PSYQ_CD_REG1: u32 = 0x1f80_1801;
+const PSYQ_CD_REG2: u32 = 0x1f80_1802;
+const PSYQ_CD_REG3: u32 = 0x1f80_1803;
 const CACHE_CONTROL: u32 = 0xfffe_0130;
 const CACHE_CONTROL_END: u32 = CACHE_CONTROL + 4;
 const BIOS_BASE: u32 = 0x1fc0_0000;
@@ -45,6 +52,8 @@ pub struct Bus {
     cdrom: CdRomController,
     dma: DmaController,
     gpu: Gpu,
+    spu: Spu,
+    mirrored_cd_command_count: u64,
     cache_control: u32,
     bios: Bios,
 }
@@ -65,6 +74,8 @@ impl Bus {
             cdrom: CdRomController::new(),
             dma: DmaController::new(),
             gpu: Gpu::new(),
+            spu: Spu::new(),
+            mirrored_cd_command_count: 0,
             cache_control: 0,
             bios,
         }
@@ -120,6 +131,8 @@ impl Bus {
         self.tick_root_counters();
         self.tick_vblank();
         self.sync_cdrom_interrupt();
+        self.cdrom.tick();
+        self.spu.tick();
     }
 
     pub fn load_ram(&mut self, address: u32, bytes: &[u8]) -> Result<()> {
@@ -144,6 +157,11 @@ impl Bus {
             }
             GPU_GP1..GPU_END => {
                 Ok(self.gpu.read_status().to_le_bytes()[(physical - GPU_GP1) as usize])
+            }
+            SPU_BASE..SPU_END => {
+                let aligned = physical & !1;
+                let byte_index = (physical & 1) as usize;
+                Ok(self.spu.read16(aligned).to_le_bytes()[byte_index])
             }
             IO_BASE..IO_END => Ok(self.io[(physical - IO_BASE) as usize]),
             CACHE_CONTROL..CACHE_CONTROL_END => {
@@ -211,6 +229,14 @@ impl Bus {
                 self.write_gpu8(physical, value);
                 Ok(())
             }
+            SPU_BASE..SPU_END => {
+                let aligned = physical & !1;
+                let byte_index = (physical & 1) as usize;
+                let mut bytes = self.spu.read16(aligned).to_le_bytes();
+                bytes[byte_index] = value;
+                self.spu.write16(aligned, u16::from_le_bytes(bytes));
+                Ok(())
+            }
             IO_BASE..IO_END => {
                 self.write_io8(physical, value);
                 Ok(())
@@ -254,6 +280,12 @@ impl Bus {
             if let Some(transfer) = self.dma.write32(physical - DMA_BASE, value) {
                 self.execute_dma_transfer(transfer)?;
             }
+            return Ok(());
+        }
+        if (SPU_BASE..SPU_END).contains(&physical) {
+            let [lo, hi, lo2, hi2] = value.to_le_bytes();
+            self.spu.write16(physical & !1, u16::from_le_bytes([lo, hi]));
+            self.spu.write16((physical & !1) + 2, u16::from_le_bytes([lo2, hi2]));
             return Ok(());
         }
 
@@ -301,6 +333,14 @@ impl Bus {
             }
             DmaChannel::CdRom if transfer.control.direction == DmaDirection::ToRam => {
                 self.execute_cdrom_dma(transfer)?;
+                self.dma.complete(transfer.channel);
+            }
+            DmaChannel::Spu if transfer.control.direction == DmaDirection::FromRam => {
+                self.execute_spu_dma_write(transfer)?;
+                self.dma.complete(transfer.channel);
+            }
+            DmaChannel::Spu if transfer.control.direction == DmaDirection::ToRam => {
+                self.execute_spu_dma_read(transfer)?;
                 self.dma.complete(transfer.channel);
             }
             _ => {
@@ -367,6 +407,33 @@ impl Bus {
                 self.cdrom.read_data_byte(),
                 self.cdrom.read_data_byte(),
             ]);
+            self.write_ram_word(address, word)?;
+            address = match transfer.control.step {
+                DmaStep::Increment => address.wrapping_add(4),
+                DmaStep::Decrement => address.wrapping_sub(4),
+            };
+        }
+        Ok(())
+    }
+
+    fn execute_spu_dma_write(&mut self, transfer: DmaTransfer) -> Result<()> {
+        let mut address = transfer.base_address;
+        let words: Vec<u32> = (0..transfer.words).map(|_| {
+            let w = self.read_ram_word(address).unwrap_or(0);
+            address = match transfer.control.step {
+                DmaStep::Increment => address.wrapping_add(4),
+                DmaStep::Decrement => address.wrapping_sub(4),
+            };
+            w
+        }).collect();
+        self.spu.dma_write(words.into_iter());
+        Ok(())
+    }
+
+    fn execute_spu_dma_read(&mut self, transfer: DmaTransfer) -> Result<()> {
+        let words = self.spu.dma_read(transfer.words);
+        let mut address = transfer.base_address;
+        for word in words {
             self.write_ram_word(address, word)?;
             address = match transfer.control.step {
                 DmaStep::Increment => address.wrapping_add(4),
@@ -477,6 +544,11 @@ impl Bus {
             GPU_GP1..GPU_END => {
                 Ok(self.gpu.read_status().to_le_bytes()[(physical - GPU_GP1) as usize])
             }
+            SPU_BASE..SPU_END => {
+                let aligned = physical & !1;
+                let byte_index = (physical & 1) as usize;
+                Ok(self.spu.read16(aligned).to_le_bytes()[byte_index])
+            }
             IO_BASE..IO_END => Ok(self.io[(physical - IO_BASE) as usize]),
             CACHE_CONTROL..CACHE_CONTROL_END => {
                 Ok(self.cache_control.to_le_bytes()[(physical - CACHE_CONTROL) as usize])
@@ -492,9 +564,17 @@ impl Bus {
     fn sync_cdrom_interrupt(&mut self) {
         let mut interrupt_status = self.io_word(INTERRUPT_STATUS_OFFSET);
 
+        if self.cdrom.has_pending_response() {
+            let _ = self.write_ram_word(PSYQ_CD_SYNC_FLAG_ADDRESS, 1);
+            let command_count = self.cdrom.command_count();
+            if self.mirrored_cd_command_count != command_count {
+                self.mirror_psyq_cd_response();
+                self.mirrored_cd_command_count = command_count;
+            }
+        }
+
         if self.cdrom.has_interrupt() {
             interrupt_status |= CDROM_INTERRUPT_BIT;
-            let _ = self.write_ram_word(PSYQ_CD_SYNC_FLAG_ADDRESS, 1);
         } else {
             interrupt_status &= !CDROM_INTERRUPT_BIT;
         }
@@ -509,6 +589,60 @@ impl Bus {
             self.io[offset + 1],
             self.io[offset + 2],
             self.io[offset + 3],
+        ])
+    }
+
+    fn mirror_psyq_cd_response(&mut self) {
+        let Some((irq, status)) = self.cdrom.pending_response() else {
+            return;
+        };
+
+        for offset in (0..RAM_SIZE.saturating_sub(16)).step_by(4) {
+            if self.read_ram_word_by_offset(offset) == PSYQ_CD_REG0
+                && self.read_ram_word_by_offset(offset + 4) == PSYQ_CD_REG1
+                && self.read_ram_word_by_offset(offset + 8) == PSYQ_CD_REG2
+                && self.read_ram_word_by_offset(offset + 12) == PSYQ_CD_REG3
+            {
+                self.mirror_psyq_cd_response_for_table(offset, irq, status);
+            }
+        }
+    }
+
+    fn mirror_psyq_cd_response_for_table(&mut self, cd_regs_offset: usize, irq: u8, status: u8) {
+        let mut candidates = Vec::with_capacity(2);
+        if cd_regs_offset >= 0x28 {
+            candidates.push(cd_regs_offset - 0x28);
+        }
+        candidates.push(cd_regs_offset + 0x1c);
+
+        for table_offset in candidates {
+            if table_offset + 4 > RAM_SIZE {
+                continue;
+            }
+            let buffer = self.read_ram_word_by_offset(table_offset);
+            let physical = mask_region(buffer);
+            if !(RAM_BASE..RAM_END).contains(&physical) {
+                continue;
+            }
+            if physical < 0x0001_0000 {
+                continue;
+            }
+            let buffer_offset = ram_offset(physical);
+            if buffer_offset + 3 >= RAM_SIZE {
+                continue;
+            }
+            self.ram[buffer_offset] = 1;
+            self.ram[buffer_offset + 1] = status;
+            self.ram[buffer_offset + 2] = irq;
+        }
+    }
+
+    fn read_ram_word_by_offset(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.ram[offset & (RAM_SIZE - 1)],
+            self.ram[(offset + 1) & (RAM_SIZE - 1)],
+            self.ram[(offset + 2) & (RAM_SIZE - 1)],
+            self.ram[(offset + 3) & (RAM_SIZE - 1)],
         ])
     }
 }

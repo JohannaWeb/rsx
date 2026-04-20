@@ -17,11 +17,15 @@ fn main() {
 
 fn run() -> ps1_emulator::Result<()> {
     let mut window_mode = false;
+    let mut bios_boot = false;
     let args = env::args_os()
         .skip(1)
         .filter(|arg| {
             if arg == "--window" {
                 window_mode = true;
+                false
+            } else if arg == "--bios-boot" {
+                bios_boot = true;
                 false
             } else {
                 true
@@ -66,19 +70,26 @@ fn run() -> ps1_emulator::Result<()> {
             let sectors = cd.sector_count();
             let mode = cd.mode();
             let path = cd.path().to_owned();
-            let boot_exe = cd.boot_exe()?;
-            console.load_exe(&boot_exe)?;
-            console.load_cd_image(cd);
+            if bios_boot {
+                console.load_cd_image(cd);
+            } else {
+                let boot_exe = cd.boot_exe()?;
+                console.load_exe(&boot_exe)?;
+                console.load_cd_image(cd);
+                println!(
+                    "loaded CD boot EXE: pc={:#010x} gp={:#010x} sp={:#010x}",
+                    boot_exe.initial_pc, boot_exe.initial_gp, boot_exe.stack_pointer
+                );
+            }
             println!(
                 "loaded CD image: {} sectors, mode {:?}, file {}",
                 sectors,
                 mode,
                 path.display()
             );
-            println!(
-                "loaded CD boot EXE: pc={:#010x} gp={:#010x} sp={:#010x}",
-                boot_exe.initial_pc, boot_exe.initial_gp, boot_exe.stack_pointer
-            );
+            if bios_boot {
+                println!("booting through BIOS reset vector");
+            }
         }
     }
 
@@ -134,6 +145,9 @@ fn run() -> ps1_emulator::Result<()> {
     if dump_pc {
         dump_near_pc(&console)?;
     }
+    if let Some(raw) = env::var_os("PS1_DUMP_WORDS") {
+        dump_words(&console, raw.to_string_lossy().as_ref())?;
+    }
     if let Some(path) = env::var_os("PS1_DUMP_FRAME") {
         dump_framebuffer(&console, PathBuf::from(path))?;
     }
@@ -141,7 +155,9 @@ fn run() -> ps1_emulator::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("usage: ps1_emulator <bios.bin> [game.exe|game.cue|game.bin] [steps] [--window]");
+    eprintln!(
+        "usage: ps1_emulator <bios.bin> [game.exe|game.cue|game.bin] [steps] [--window] [--bios-boot]"
+    );
     eprintln!(
         "loads a PlayStation BIOS, optionally loads a PS-X EXE or CD image, then executes CPU steps"
     );
@@ -184,14 +200,21 @@ fn step_with_trace(
         && let Some(call) = console.pending_bios_call()
     {
         println!(
-            "bios call {}({:#04x}) ra={:#010x}",
-            call.vector, call.function, before.regs[31]
+            "bios call {}({:#04x}) ra={:#010x} v0={:#010x} a0={:#010x} a1={:#010x} a2={:#010x}",
+            call.vector,
+            call.function,
+            before.regs[31],
+            before.regs[2],
+            before.regs[4],
+            before.regs[5],
+            before.regs[6]
         );
     }
     if let Err(err) = console.step() {
         let instruction = match before_instruction {
             Some(instruction) => instruction,
-            None => console.peek32(before.pc)?,
+            None if before.pc & 3 == 0 => console.peek32(before.pc)?,
+            None => 0,
         };
         eprintln!(
             "step failed at pc={:#010x} instr={:#010x}",
@@ -221,6 +244,7 @@ fn step_with_trace(
         );
         return Ok(true);
     }
+    /*
     if trace.trace_zero_run && *trace.zero_run >= 128 {
         println!(
             "zero-run transition: last_nonzero_pc={:#010x} instr={:#010x} current_pc={:#010x}",
@@ -228,6 +252,7 @@ fn step_with_trace(
         );
         return Ok(true);
     }
+    */
 
     Ok(false)
 }
@@ -311,6 +336,29 @@ fn dump_near_pc(console: &Console) -> ps1_emulator::Result<()> {
         );
     }
     Ok(())
+}
+
+fn dump_words(console: &Console, spec: &str) -> ps1_emulator::Result<()> {
+    let (address, words) = match spec.split_once(':') {
+        Some((address, words)) => (parse_u32(address), words.parse::<u32>().unwrap_or(16)),
+        None => (parse_u32(spec), 16),
+    };
+    let start = address & !3;
+    println!("words at {start:#010x}:");
+    for offset in 0..words {
+        let address = start.wrapping_add(offset * 4);
+        println!("  {address:#010x}: {:#010x}", console.peek32(address)?);
+    }
+    Ok(())
+}
+
+fn parse_u32(value: &str) -> u32 {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u32::from_str_radix(value, 16).unwrap_or(0)
 }
 
 fn dump_framebuffer(console: &Console, path: PathBuf) -> ps1_emulator::Result<()> {
