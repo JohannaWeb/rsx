@@ -62,16 +62,16 @@ Set environment variables for debugging:
 
 | File | Component | Status |
 |------|-------------|--------|
-| `src/cpu.rs` | MIPS R3000A CPU | ✅ Done |
-| `src/gte.rs` | Geometry Transformation Engine | ✅ Done |
-| `src/gpu.rs` | Graphics Processing Unit | ✅ Done |
-| `src/bus.rs` | Memory bus and I/O routing | ✅ Done |
-| `src/dma.rs` | Direct Memory Access controller | ✅ Done |
-| `src/spu.rs` | Sound Processing Unit | ✅ Done |
-| `src/cdrom.rs` | CD-ROM drive emulation | ✅ Done |
-| `src/bios.rs` | BIOS ROM and HLE | ✅ Done |
-| `src/exe.rs` | PS-X EXE file loader | ✅ Done |
-| `src/console.rs` | System integration | ✅ Done |
+| `src/cpu.rs` | MIPS R3000A CPU | Done |
+| `src/gte.rs` | Geometry Transformation Engine | Done |
+| `src/gpu.rs` | Graphics Processing Unit | Done |
+| `src/bus.rs` | Memory bus and I/O routing |  Done |
+| `src/dma.rs` | Direct Memory Access controller | Done |
+| `src/spu.rs` | Sound Processing Unit |  Done |
+| `src/cdrom.rs` | CD-ROM drive emulation |  Done |
+| `src/bios.rs` | BIOS ROM and HLE |  Done |
+| `src/exe.rs` | PS-X EXE file loader | Done |
+| `src/console.rs` | System integration |  Done |
 
 ## Agent Architecture
 
