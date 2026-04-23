@@ -5,7 +5,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 1. The Processor Agent (CPU)
-**Symbol:** `src/cpu.rs`  
+**Symbol:** `src/cpu/mod.rs`  
 **Role:** The core executor of the system, simulating the MIPS-compatible R3000A (Little Endian).
 
 ### Responsibilities:
@@ -22,7 +22,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 2. The Graphics Agent (GPU) ✅ DONE
-**Symbol:** `src/gpu.rs`  
+**Symbol:** `src/gpu/mod.rs`  
 **Role:** Simulates the specialized graphics hardware and its 1MB Video RAM (VRAM).
 
 ### Responsibilities:
@@ -39,7 +39,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 3. The Geometry Agent (GTE) ✅ DONE
-**Symbol:** `src/gte.rs`  
+**Symbol:** `src/gte/mod.rs`  
 **Role:** The Geometry Transformation Engine (COP2 coprocessor) - handles 3D math operations.
 
 ### Responsibilities:
@@ -57,7 +57,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 4. The Interconnect Agent (Bus) ✅ DONE
-**Symbol:** `src/bus.rs`  
+**Symbol:** `src/bus/mod.rs`  
 **Role:** The "Nervous System" of the project, routing all memory-mapped I/O (MMIO) requests.
 
 ### Responsibilities:
@@ -76,7 +76,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 5. The Data Mover Agent (DMA) ✅ DONE
-**Symbol:** `src/dma.rs`  
+**Symbol:** `src/dma/mod.rs`  
 **Role:** High-speed data transport between RAM and peripherals.
 
 ### Responsibilities:
@@ -92,7 +92,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 6. The Media Agent (CDROM) ✅ DONE
-**Symbol:** `src/cdrom.rs`, `src/ecm.rs`  
+**Symbol:** `src/cdrom/mod.rs`, `src/ecm/mod.rs`  
 **Role:** Simulates the asynchronous CD-ROM drive and its filesystem.
 
 ### Responsibilities:
@@ -109,7 +109,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 7. The Firmware Agent (BIOS) ✅ DONE
-**Symbol:** `src/bios.rs`  
+**Symbol:** `src/bios/mod.rs`  
 **Role:** Loads and serves the original SCPH1001.BIN binary.
 
 ### Responsibilities:
@@ -124,7 +124,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 8. The Sound Agent (SPU) ✅ DONE
-**Symbol:** `src/spu.rs`  
+**Symbol:** `src/spu/mod.rs`  
 **Role:** Simulates the PS1's Sound Processing Unit — 24 voices with ADSR envelopes and 512KB of sound RAM.
 
 ### Responsibilities:
@@ -143,7 +143,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 9. The Executable Loader (EXE) ✅ DONE
-**Symbol:** `src/exe.rs`  
+**Symbol:** `src/exe/mod.rs`  
 **Role:** Parses and loads PS-X EXE files (playable game executables).
 
 ### Responsibilities:
@@ -158,7 +158,7 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ---
 
 ## 10. The Orchestrator Agent (Console) ✅ DONE
-**Symbol:** `src/console.rs`, `src/main.rs`  
+**Symbol:** `src/console/mod.rs`, `src/main.rs`  
 **Role:** The top-level system integrator.
 
 ### Responsibilities:
@@ -171,20 +171,61 @@ This document defines the specialized "Agent" roles within the PS1 emulator proj
 ### Environment Variables for Debugging:
 - `PS1_TRACE_SYSCALLS`: Print syscall instructions
 - `PS1_TRACE_BIOS_CALLS`: Print BIOS function calls
-- `PS1_DUMP_PC`: Dump PC-relative memory on errors
-- `PS1_DUMP_FRAME`: Save framebuffer to PPM file
-- `PS1_TRACE_LOW_PC`: Trace PC transitions below 0x10000
+- `PS1_DUMP_PC`: Dump registers + instructions near PC on error
+- `PS1_DUMP_FRAME`: Save framebuffer to PPM file path
+- `PS1_DUMP_WORDS`: Dump words at address, e.g. `0x80001000:16`
+- `PS1_TRACE_LOW_PC`: Stop and trace when PC drops below 0x10000
+- `PS1_TRACE_INTERRUPTS`: Trace interrupt entry/return (eprintln)
+- `PS1_TRACE_PC`: Disassemble every instruction above 0x80000000
+- `RUST_LOG`: Control log levels (`error`, `warn`, `info`, `debug`)
+
+### Log-level Coverage (set via `RUST_LOG`):
+- **error**: Unsupported instructions (with disassembly + ra/sp), unhandled bus addresses, DMA out-of-range access, DMA byte-write errors
+- **warn**: BREAK instructions, unrecognized COP2 rs opcodes, unhandled DMA channel/direction combos, GPU linked-list DMA loop guard triggered, illegal BIOS writes
+- **info**: BIOS call vectors with argument registers
 
 ---
 
 ## 11. The Error Handler (Error) ✅ DONE
-**Symbol:** `src/error.rs`  
+**Symbol:** `src/error/mod.rs`  
 **Role:** Centralized error types and Result alias for the emulator.
 
 ### Responsibilities:
 - **Error Types:** Defines emulator-specific errors (invalid instructions, memory errors, CD read errors, etc.).
 - **Result Alias:** Provides a convenient `Result<T>` type for the crate.
 - **Error Conversion:** Implements conversions from external error types (IO, parsing, etc.).
+
+---
+
+## 12. Principal SWE: Post-Mortem & Architecture Critique
+
+### 1. Monolithic "Mod.rs" Syndrome
+The project is drowning in giant `mod.rs` files. `src/cpu/mod.rs` (1000+ lines) and `src/bus/mod.rs` (500+ lines) are mixing instruction decoding, hardware logic, HLE stubs, and tests in a single file. 
+- **Fix:** Decompose into submodules (e.g., `cpu/decode.rs`, `cpu/instructions.rs`, `cpu/bios_hle.rs`).
+
+### 2. Performance: The "Death by a Thousand Calls"
+The memory subsystem is fundamentally slow. `Bus::read32` calls `read8` four times, which in turn performs range checks and matching on every single byte. In an emulator where memory access is the #1 bottleneck, this is unacceptable.
+- **Fix:** Implement direct word-access paths for RAM and BIOS. Use `unsafe` for VRAM/RAM access if necessary after profiling.
+
+### 3. The "God Bus" Anti-Pattern
+The `Bus` struct isn't just a router; it's a controller. It's handling "PSYQ CD Mirroring" hacks which should be in the CDROM or BIOS modules. It's managing VBlank ticks and root counters.
+- **Fix:** The Bus should strictly route. Peripherals should tick themselves or be ticked by a system orchestrator.
+
+### 4. HLE/LLE Identity Crisis
+The CPU module contains hardcoded BIOS syscall logic (`execute_bios_call`). This is a layer violation. The CPU executes instructions; it shouldn't care about the A0/B0/C0 vector tables of a specific firmware.
+- **Fix:** Move BIOS HLE into `src/bios/mod.rs` or a dedicated interceptor.
+
+### 5. Global Debug State Garbage
+Relying on `std::env::var_os` deep inside the CPU and GPU for tracing is amateur. It makes the system impossible to test in parallel or configure programmatically.
+- **Fix:** Pass a `Config` or `DebugContext` object, or use a proper tracing subscriber.
+
+### 6. Instruction Decoding: 1990 called...
+The use of massive constant arrays of function pointers is efficient but brittle and a pain to maintain. 
+- **Fix:** Use a more descriptive decoding DSL or at least a structured `match` that the compiler can optimize into a jump table.
+
+### 7. Missing Lifecycle & Synchronization
+The "main loop" in `main.rs` is doing too much. The synchronization between components (CPU/GPU/DMA) is implicit and fragile.
+- **Fix:** Implement a proper `System` struct that manages the clock and component synchronization explicitly.
 
 ---
 

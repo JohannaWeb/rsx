@@ -1,3 +1,25 @@
+pub const DMA_CHANNEL_COUNT: usize = 7;
+
+const DMA_CHANNEL_STRIDE: u32 = 0x10;
+const DMA_BASE_REGISTER_OFFSET: u32 = 0x00;
+const DMA_BLOCK_CONTROL_REGISTER_OFFSET: u32 = 0x04;
+const DMA_CHANNEL_CONTROL_REGISTER_OFFSET: u32 = 0x08;
+const DMA_GLOBAL_CONTROL_OFFSET: u32 = 0x70;
+const DMA_INTERRUPT_OFFSET: u32 = 0x74;
+const DMA_ADDRESS_MASK: u32 = 0x00ff_ffff;
+const DMA_WORD_COUNT_MASK: u32 = 0x0000_ffff;
+const DMA_BLOCK_COUNT_SHIFT: u32 = 16;
+const DMA_SYNC_SHIFT: u32 = 9;
+const DMA_SYNC_MASK: u32 = 0x3;
+const DMA_DIRECTION_BIT: u32 = 1 << 0;
+const DMA_STEP_BIT: u32 = 1 << 1;
+const DMA_ENABLE_BIT: u32 = 1 << 24;
+const DMA_TRIGGER_BIT: u32 = 1 << 28;
+const DMA_INTERRUPT_FLAG_SHIFT: usize = 24;
+const DMA_MAX_WORDS_PER_BLOCK: usize = 0x1_0000;
+const DMA_BASE_ADDRESS_ALIGNMENT_MASK: u32 = 0x001f_fffc;
+const DMA_DEFAULT_CONTROL: u32 = 0x0765_4321;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaChannel {
     MdecIn,
@@ -53,14 +75,28 @@ struct ChannelRegisters {
     control: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaChannelSnapshot {
+    pub base_address: u32,
+    pub block_control: u32,
+    pub control: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaDebugState {
+    pub control: u32,
+    pub interrupt: u32,
+    pub channels: [DmaChannelSnapshot; DMA_CHANNEL_COUNT],
+}
+
 pub struct DmaController {
-    channels: [ChannelRegisters; 7],
+    channels: [ChannelRegisters; DMA_CHANNEL_COUNT],
     control: u32,
     interrupt: u32,
 }
 
 impl DmaChannel {
-    fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
             Self::MdecIn => 0,
             Self::MdecOut => 1,
@@ -88,7 +124,7 @@ impl DmaChannel {
 
 impl DmaControl {
     fn decode(value: u32) -> Self {
-        let sync = match (value >> 9) & 3 {
+        let sync = match (value >> DMA_SYNC_SHIFT) & DMA_SYNC_MASK {
             0 => DmaSyncMode::Manual,
             1 => DmaSyncMode::Request,
             2 => DmaSyncMode::LinkedList,
@@ -96,19 +132,19 @@ impl DmaControl {
         };
 
         Self {
-            direction: if value & 1 == 0 {
+            direction: if value & DMA_DIRECTION_BIT == 0 {
                 DmaDirection::ToRam
             } else {
                 DmaDirection::FromRam
             },
-            step: if value & (1 << 1) == 0 {
+            step: if value & DMA_STEP_BIT == 0 {
                 DmaStep::Increment
             } else {
                 DmaStep::Decrement
             },
             sync,
-            trigger: value & (1 << 28) != 0,
-            enable: value & (1 << 24) != 0,
+            trigger: value & DMA_TRIGGER_BIT != 0,
+            enable: value & DMA_ENABLE_BIT != 0,
         }
     }
 
@@ -120,38 +156,52 @@ impl DmaControl {
 impl DmaController {
     pub fn new() -> Self {
         Self {
-            channels: [ChannelRegisters::default(); 7],
-            control: 0x0765_4321,
+            channels: [ChannelRegisters::default(); DMA_CHANNEL_COUNT],
+            control: DMA_DEFAULT_CONTROL,
             interrupt: 0,
         }
     }
 
     pub fn read32(&self, offset: u32) -> u32 {
         match offset {
-            0x70 => self.control,
-            0x74 => self.interrupt,
+            DMA_GLOBAL_CONTROL_OFFSET => self.control,
+            DMA_INTERRUPT_OFFSET => self.interrupt,
             _ => self.channel_register(offset).unwrap_or_default(),
+        }
+    }
+
+    pub fn debug_state(&self) -> DmaDebugState {
+        DmaDebugState {
+            control: self.control,
+            interrupt: self.interrupt,
+            channels: self.channels.map(|channel| DmaChannelSnapshot {
+                base_address: channel.base_address,
+                block_control: channel.block_control,
+                control: channel.control,
+            }),
         }
     }
 
     pub fn write32(&mut self, offset: u32, value: u32) -> Option<DmaTransfer> {
         match offset {
-            0x70 => {
+            DMA_GLOBAL_CONTROL_OFFSET => {
                 self.control = value;
                 None
             }
-            0x74 => {
+            DMA_INTERRUPT_OFFSET => {
                 self.interrupt = value;
                 None
             }
             _ => {
-                let channel = DmaChannel::from_index((offset / 0x10) as usize)?;
-                let register = offset & 0x0f;
+                let channel = DmaChannel::from_index((offset / DMA_CHANNEL_STRIDE) as usize)?;
+                let register = offset & (DMA_CHANNEL_STRIDE - 1);
                 let channel_registers = &mut self.channels[channel.index()];
                 match register {
-                    0x00 => channel_registers.base_address = value & 0x00ff_ffff,
-                    0x04 => channel_registers.block_control = value,
-                    0x08 => {
+                    DMA_BASE_REGISTER_OFFSET => {
+                        channel_registers.base_address = value & DMA_ADDRESS_MASK;
+                    }
+                    DMA_BLOCK_CONTROL_REGISTER_OFFSET => channel_registers.block_control = value,
+                    DMA_CHANNEL_CONTROL_REGISTER_OFFSET => {
                         channel_registers.control = value;
                         let control = DmaControl::decode(value);
                         if control.active() {
@@ -176,18 +226,18 @@ impl DmaController {
     pub fn complete(&mut self, channel: DmaChannel) {
         log::debug!("DMA transfer complete: {channel:?}");
         let registers = &mut self.channels[channel.index()];
-        registers.control &= !(1 << 24);
-        registers.control &= !(1 << 28);
-        self.interrupt |= 1 << (24 + channel.index());
+        registers.control &= !DMA_ENABLE_BIT;
+        registers.control &= !DMA_TRIGGER_BIT;
+        self.interrupt |= 1 << (DMA_INTERRUPT_FLAG_SHIFT + channel.index());
     }
 
     fn channel_register(&self, offset: u32) -> Option<u32> {
-        let channel = DmaChannel::from_index((offset / 0x10) as usize)?;
+        let channel = DmaChannel::from_index((offset / DMA_CHANNEL_STRIDE) as usize)?;
         let registers = &self.channels[channel.index()];
-        match offset & 0x0f {
-            0x00 => Some(registers.base_address),
-            0x04 => Some(registers.block_control),
-            0x08 => Some(registers.control),
+        match offset & (DMA_CHANNEL_STRIDE - 1) {
+            DMA_BASE_REGISTER_OFFSET => Some(registers.base_address),
+            DMA_BLOCK_CONTROL_REGISTER_OFFSET => Some(registers.block_control),
+            DMA_CHANNEL_CONTROL_REGISTER_OFFSET => Some(registers.control),
             _ => Some(0),
         }
     }
@@ -196,7 +246,7 @@ impl DmaController {
         let registers = &self.channels[channel.index()];
         DmaTransfer {
             channel,
-            base_address: registers.base_address & 0x001f_fffc,
+            base_address: registers.base_address & DMA_BASE_ADDRESS_ALIGNMENT_MASK,
             words: transfer_words(registers.block_control, control.sync),
             control,
         }
@@ -210,25 +260,25 @@ impl Default for DmaController {
 }
 
 fn transfer_words(block_control: u32, sync: DmaSyncMode) -> usize {
-    let block_size = (block_control & 0xffff) as usize;
-    let block_count = (block_control >> 16) as usize;
+    let block_size = (block_control & DMA_WORD_COUNT_MASK) as usize;
+    let block_count = (block_control >> DMA_BLOCK_COUNT_SHIFT) as usize;
 
     match sync {
         DmaSyncMode::Manual => {
             if block_size == 0 {
-                0x1_0000
+                DMA_MAX_WORDS_PER_BLOCK
             } else {
                 block_size
             }
         }
         DmaSyncMode::Request => {
             let block_size = if block_size == 0 {
-                0x1_0000
+                DMA_MAX_WORDS_PER_BLOCK
             } else {
                 block_size
             };
             let block_count = if block_count == 0 {
-                0x1_0000
+                DMA_MAX_WORDS_PER_BLOCK
             } else {
                 block_count
             };

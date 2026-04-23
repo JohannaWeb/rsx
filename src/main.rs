@@ -1,14 +1,31 @@
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use minifb::{Key, ScaleMode, Window, WindowOptions};
-use ps1_emulator::{CdImage, Console, PsxExe, VRAM_HEIGHT, VRAM_WIDTH};
+use ps1_emulator::{
+    CdImage, Console, CrashContext, InstructionTraceEntry, PsxExe, VRAM_HEIGHT, VRAM_WIDTH,
+};
 
 const WINDOW_CPU_STEPS_PER_FRAME: usize = 20_000;
+const DEFAULT_CPU_STEPS: usize = 16;
+const CRASH_HISTORY_SIZE: usize = 256;
+const SYSCALL_OPCODE: u32 = 0x0000_000c;
+const RA_REGISTER: usize = 31;
+const V0_REGISTER: usize = 2;
+const A0_REGISTER: usize = 4;
+const A1_REGISTER: usize = 5;
+const A2_REGISTER: usize = 6;
+const LOW_PC_THRESHOLD: u32 = 0x0001_0000;
+const UNKNOWN_INSTRUCTION: u32 = 0;
+const INVALID_SYNC_FLAG_WORD: u32 = 0xffff_ffff;
+const PSYQ_CD_SYNC_FLAG_ADDRESS: u32 = 0x8008_9d9c;
+const RGB24_STRIDE: usize = 3;
+const ZERO_RUN_BREAK_THRESHOLD: usize = 128;
 
 fn main() {
-    env_logger::init();
+    init_logger();
     if let Err(err) = run() {
         log::error!("{err}");
         std::process::exit(1);
@@ -53,7 +70,7 @@ fn run() -> ps1_emulator::Result<()> {
         .map(|raw| raw.to_string_lossy().parse::<usize>())
         .transpose()
         .map_err(|_| ps1_emulator::Error::InvalidArgument("steps must be a number".into()))?
-        .unwrap_or(16);
+        .unwrap_or(DEFAULT_CPU_STEPS);
 
     let mut console = Console::from_bios_file(bios_path)?;
 
@@ -98,7 +115,6 @@ fn run() -> ps1_emulator::Result<()> {
     let trace_syscalls = env::var_os("PS1_TRACE_SYSCALLS").is_some();
     let trace_bios_calls = env::var_os("PS1_TRACE_BIOS_CALLS").is_some();
     let dump_pc = env::var_os("PS1_DUMP_PC").is_some();
-    let needs_instruction_trace = trace_zero_run || trace_syscalls;
     let mut zero_run = 0usize;
     let mut last_nonzero_pc = 0;
     let mut last_nonzero_instruction = 0;
@@ -108,26 +124,29 @@ fn run() -> ps1_emulator::Result<()> {
         trace_syscalls,
         trace_bios_calls,
         dump_pc,
-        needs_instruction_trace,
         zero_run: &mut zero_run,
         last_nonzero_pc: &mut last_nonzero_pc,
         last_nonzero_instruction: &mut last_nonzero_instruction,
     };
+    let mut instruction_history = VecDeque::with_capacity(CRASH_HISTORY_SIZE);
 
     if window_mode {
-        run_window(&mut console, &mut trace)?;
+        run_window(&mut console, &mut trace, &mut instruction_history)?;
     } else {
         for _ in 0..steps {
-            if step_with_trace(&mut console, &mut trace)? {
+            if step_with_trace(&mut console, &mut trace, &mut instruction_history)? {
                 break;
             }
         }
     }
 
-    println!("{}", console.cpu_state());
-    if console.cd_image().is_some() {
+    let cpu = console.cpu_state();
+    println!("{}", cpu);
+    if console.cd_image_loaded() {
         let cdrom = console.cdrom_debug_state();
-        let cd_sync_flag = console.peek32(0x8008_9d9c).unwrap_or(0xffff_ffff);
+        let cd_sync_flag = console
+            .peek32(PSYQ_CD_SYNC_FLAG_ADDRESS)
+            .unwrap_or(INVALID_SYNC_FLAG_WORD);
         println!(
             "cdrom: commands={} dma_read_bytes={} last_command={:?} response_len={} data_len={} irq_enable={:#04x} irq_flag={:#04x} status={:#04x} mode={:#04x} sync_flag={:#010x}",
             console.cdrom_command_count(),
@@ -154,6 +173,30 @@ fn run() -> ps1_emulator::Result<()> {
     Ok(())
 }
 
+fn init_logger() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(log::LevelFilter::Warn);
+
+    let file = fern::log_file("ps1.log").expect("failed to open ps1.log");
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{} {}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                record.level(),
+                message
+            ))
+        })
+        .level(level)
+        .chain(std::io::stderr())
+        .chain(file)
+        .apply()
+        .expect("failed to init logger");
+}
+
 fn print_usage() {
     eprintln!(
         "usage: ps1_emulator <bios.bin> [game.exe|game.cue|game.bin] [steps] [--window] [--bios-boot]"
@@ -169,7 +212,6 @@ struct TraceState<'a> {
     trace_syscalls: bool,
     trace_bios_calls: bool,
     dump_pc: bool,
-    needs_instruction_trace: bool,
     zero_run: &'a mut usize,
     last_nonzero_pc: &'a mut u32,
     last_nonzero_instruction: &'a mut u32,
@@ -178,22 +220,32 @@ struct TraceState<'a> {
 fn step_with_trace(
     console: &mut Console,
     trace: &mut TraceState<'_>,
+    instruction_history: &mut VecDeque<InstructionTraceEntry>,
 ) -> ps1_emulator::Result<bool> {
     let before = console.cpu_state();
-    let before_instruction = if trace.needs_instruction_trace {
+    let before_instruction = if before.pc & 3 == 0 {
         Some(console.peek32(before.pc)?)
     } else {
         None
     };
-    if trace.trace_syscalls && before_instruction == Some(0x0000_000c) {
+    if let Some(opcode) = before_instruction {
+        push_instruction_history(
+            instruction_history,
+            InstructionTraceEntry {
+                address: before.pc,
+                opcode,
+            },
+        );
+    }
+    if trace.trace_syscalls && before_instruction == Some(SYSCALL_OPCODE) {
         println!(
             "syscall at pc={:#010x} ra={:#010x} v0={:#010x} a0={:#010x} a1={:#010x} a2={:#010x}",
             before.pc,
-            before.regs[31],
-            before.regs[2],
-            before.regs[4],
-            before.regs[5],
-            before.regs[6]
+            before.regs[RA_REGISTER],
+            before.regs[V0_REGISTER],
+            before.regs[A0_REGISTER],
+            before.regs[A1_REGISTER],
+            before.regs[A2_REGISTER]
         );
     }
     if trace.trace_bios_calls
@@ -203,23 +255,24 @@ fn step_with_trace(
             "bios call {}({:#04x}) ra={:#010x} v0={:#010x} a0={:#010x} a1={:#010x} a2={:#010x}",
             call.vector,
             call.function,
-            before.regs[31],
-            before.regs[2],
-            before.regs[4],
-            before.regs[5],
-            before.regs[6]
+            before.regs[RA_REGISTER],
+            before.regs[V0_REGISTER],
+            before.regs[A0_REGISTER],
+            before.regs[A1_REGISTER],
+            before.regs[A2_REGISTER]
         );
     }
     if let Err(err) = console.step() {
-        let instruction = match before_instruction {
-            Some(instruction) => instruction,
-            None if before.pc & 3 == 0 => console.peek32(before.pc)?,
-            None => 0,
-        };
+        let instruction = before_instruction.unwrap_or(UNKNOWN_INSTRUCTION);
+        let crash = console.crash_context(
+            instruction_history.iter().copied().collect(),
+            Some(err.to_string()),
+        );
         eprintln!(
             "step failed at pc={:#010x} instr={:#010x}",
             before.pc, instruction
         );
+        print_crash_context(&crash);
         if trace.dump_pc {
             dump_near_pc(console)?;
         }
@@ -233,7 +286,7 @@ fn step_with_trace(
         *trace.last_nonzero_pc = before.pc;
         *trace.last_nonzero_instruction = instruction;
     }
-    if trace.trace_low_pc && before.pc >= 0x0001_0000 && after.pc < 0x0001_0000 {
+    if trace.trace_low_pc && before.pc >= LOW_PC_THRESHOLD && after.pc < LOW_PC_THRESHOLD {
         println!(
             "low-pc transition: before_pc={:#010x} before_next={:#010x} instr={:#010x} after_pc={:#010x} after_next={:#010x}",
             before.pc,
@@ -244,20 +297,80 @@ fn step_with_trace(
         );
         return Ok(true);
     }
-    /*
-    if trace.trace_zero_run && *trace.zero_run >= 128 {
+    if trace.trace_zero_run && *trace.zero_run >= ZERO_RUN_BREAK_THRESHOLD {
         println!(
             "zero-run transition: last_nonzero_pc={:#010x} instr={:#010x} current_pc={:#010x}",
             *trace.last_nonzero_pc, *trace.last_nonzero_instruction, after.pc
         );
         return Ok(true);
     }
-    */
 
     Ok(false)
 }
 
-fn run_window(console: &mut Console, trace: &mut TraceState<'_>) -> ps1_emulator::Result<()> {
+fn push_instruction_history(
+    history: &mut VecDeque<InstructionTraceEntry>,
+    entry: InstructionTraceEntry,
+) {
+    if history.len() == CRASH_HISTORY_SIZE {
+        history.pop_front();
+    }
+    history.push_back(entry);
+}
+
+fn print_crash_context(crash: &CrashContext) {
+    eprintln!("crash context:");
+    if let Some(error) = &crash.last_error {
+        eprintln!("  error: {error}");
+    }
+    eprintln!(
+        "  cpu: pc={:#010x} next_pc={:#010x} hi={:#010x} lo={:#010x}",
+        crash.cpu.pc, crash.cpu.next_pc, crash.cpu.hi, crash.cpu.lo
+    );
+    for (index, value) in crash.cpu.regs.iter().enumerate() {
+        eprintln!("  r{index:02}={value:#010x}");
+    }
+    eprintln!(
+        "  dma: control={:#010x} interrupt={:#010x}",
+        crash.dma.control, crash.dma.interrupt
+    );
+    for (index, channel) in crash.dma.channels.iter().enumerate() {
+        eprintln!(
+            "  dma[{index}]: base={:#010x} block={:#010x} control={:#010x}",
+            channel.base_address, channel.block_control, channel.control
+        );
+    }
+    eprintln!(
+        "  gpu: status={:#010x} gp0_fifo_depth={} image_load_active={} last_command={:?} draws={} uploads={} unknown={}",
+        crash.gpu.status,
+        crash.gpu.gp0_fifo_depth,
+        crash.gpu.image_load_active,
+        crash.gpu.last_command,
+        crash.gpu.draw_count,
+        crash.gpu.image_upload_count,
+        crash.gpu.unknown_command_count
+    );
+    eprintln!(
+        "  cdrom: last_command={:?} response_len={} data_len={} irq_enable={:#04x} irq_flag={:#04x} status={:#04x} mode={:#04x}",
+        crash.cdrom.last_command,
+        crash.cdrom.response_len,
+        crash.cdrom.data_len,
+        crash.cdrom.interrupt_enable,
+        crash.cdrom.interrupt_flag,
+        crash.cdrom.status,
+        crash.cdrom.mode
+    );
+    eprintln!("  recent instructions:");
+    for entry in &crash.recent_instructions {
+        eprintln!("    {:#010x}: {:#010x}", entry.address, entry.opcode);
+    }
+}
+
+fn run_window(
+    console: &mut Console,
+    trace: &mut TraceState<'_>,
+    instruction_history: &mut VecDeque<InstructionTraceEntry>,
+) -> ps1_emulator::Result<()> {
     let mut window = Window::new(
         "ps1 emulator",
         VRAM_WIDTH,
@@ -272,9 +385,10 @@ fn run_window(console: &mut Console, trace: &mut TraceState<'_>) -> ps1_emulator
     window.set_target_fps(60);
 
     let mut window_buffer = vec![0_u32; VRAM_WIDTH * VRAM_HEIGHT];
+    let mut display_rgb = vec![0_u8; VRAM_WIDTH * VRAM_HEIGHT * RGB24_STRIDE];
     while window.is_open() && !window.is_key_down(Key::Escape) {
         for _ in 0..WINDOW_CPU_STEPS_PER_FRAME {
-            if step_with_trace(console, trace)? {
+            if step_with_trace(console, trace, instruction_history)? {
                 break;
             }
         }
@@ -285,15 +399,20 @@ fn run_window(console: &mut Console, trace: &mut TraceState<'_>) -> ps1_emulator
         if window_buffer.len() != needed {
             window_buffer.resize(needed, 0);
         }
-        rgb_to_window_buffer(&console.framebuffer_rgb(), &mut window_buffer);
+        let needed_rgb = needed * RGB24_STRIDE;
+        if display_rgb.len() != needed_rgb {
+            display_rgb.resize(needed_rgb, 0);
+        }
+        console.copy_display_rgb_into(&mut display_rgb);
+        rgb_to_window_buffer(&display_rgb[..needed_rgb], &mut window_buffer);
         let cpu = console.cpu_state();
-        let cdrom = console.cdrom_debug_state();
         let gpu = console.gpu_debug_state();
+        let cdrom_command_count = console.cdrom_command_count();
         window.set_title(&format!(
             "ps1 emulator pc={:#010x} cd={} last_cd={:?} gp0={} draws={} uploads={} unk={}",
             cpu.pc,
-            console.cdrom_command_count(),
-            cdrom.last_command,
+            cdrom_command_count,
+            gpu.last_command,
             gpu.command_count,
             gpu.draw_count,
             gpu.image_upload_count,
@@ -308,7 +427,7 @@ fn run_window(console: &mut Console, trace: &mut TraceState<'_>) -> ps1_emulator
 }
 
 fn rgb_to_window_buffer(rgb: &[u8], window_buffer: &mut [u32]) {
-    for (source, dest) in rgb.chunks_exact(3).zip(window_buffer.iter_mut()) {
+    for (source, dest) in rgb.chunks_exact(RGB24_STRIDE).zip(window_buffer.iter_mut()) {
         *dest = ((source[0] as u32) << 16) | ((source[1] as u32) << 8) | source[2] as u32;
     }
 }

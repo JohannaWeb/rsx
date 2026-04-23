@@ -37,6 +37,21 @@ impl Bios {
     pub fn read8(&self, offset: u32) -> u8 {
         self.bytes[offset as usize % BIOS_SIZE]
     }
+
+    pub fn read16(&self, offset: u32) -> u16 {
+        let offset = offset as usize % BIOS_SIZE;
+        u16::from_le_bytes([self.bytes[offset], self.bytes[offset + 1]])
+    }
+
+    pub fn read32(&self, offset: u32) -> u32 {
+        let offset = offset as usize % BIOS_SIZE;
+        u32::from_le_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+        ])
+    }
 }
 
 #[cfg(test)]

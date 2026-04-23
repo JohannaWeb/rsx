@@ -1,15 +1,11 @@
 /target
-
-# BIOS and game dumps - do not commit
-*.bin
-*.BIN
-*.ecm
-*.cue
-*.cue.old
-*.rar
-*.iso
-*.img
-*.ppm
-
-# IDE
+**/*.bin
+**/*.BIN
+**/*.7z
+**/*.ppm
+**/*.cue
 .idea/
+.codex/
+.codex
+ps1.log
+Cargo.lock

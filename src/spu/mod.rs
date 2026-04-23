@@ -7,6 +7,46 @@ pub const SPU_RAM_SIZE: usize = 512 * 1024;
 const VOICE_COUNT: usize = 24;
 const TICKS_PER_SAMPLE: u32 = 768; // 33_868_800 Hz / 44100 Hz ≈ 768
 const AUDIO_BUFFER_SAMPLES: usize = 4096;
+const ADPCM_BLOCK_BYTES: u32 = 16;
+const ADPCM_BLOCK_SAMPLES: usize = 28;
+const ADPCM_DATA_BYTES: usize = 14;
+const ADPCM_HEADER_BYTES: usize = 2;
+const ADPCM_SHIFT_MASK: u8 = 0x0f;
+const ADPCM_FILTER_SHIFT: u8 = 4;
+const ADPCM_FILTER_MASK: u8 = 0x07;
+const ADPCM_MAX_FILTER: usize = 4;
+const ADPCM_NIBBLE_MASK: i32 = 0x0f;
+const ADPCM_SIGNED_NIBBLE_THRESHOLD: i32 = 8;
+const ADPCM_SIGN_EXTEND_BIAS: i32 = 16;
+const ADPCM_SAMPLE_SHIFT: i32 = 12;
+const ADPCM_FILTER_SCALE: i32 = 64;
+const ADPCM_FILTER_ROUNDING: i32 = 32;
+const ADPCM_LOOP_START_FLAG: u8 = 0x04;
+const ADPCM_END_FLAG: u8 = 0x01;
+const ADPCM_REPEAT_FLAG: u8 = 0x02;
+const SPU_ADDRESS_SHIFT: u32 = 3;
+const PITCH_COUNTER_FRACTION_BITS: u32 = 12;
+const PITCH_COUNTER_MASK: u32 = 0x0fff;
+const ADSR_COUNTER_RELOAD: i32 = 1;
+const ADSR_MAX_VOLUME: i16 = 0x7fff;
+const ADSR_EXP_THRESHOLD: i16 = 0x6000;
+const ADSR_VOLUME_FRACTION_BITS: u32 = 15;
+const ADSR_ATTACK_RATE_SHIFT: u16 = 8;
+const ADSR_RATE_MASK: u16 = 0x7f;
+const ADSR_EXPONENTIAL_BIT: u16 = 0x8000;
+const ADSR_DECAY_RATE_SHIFT: u16 = 4;
+const ADSR_DECAY_RATE_MASK: u16 = 0x0f;
+const ADSR_DECAY_RATE_BASE: u16 = 0x18;
+const ADSR_SUSTAIN_LEVEL_MASK: u16 = 0x0f;
+const ADSR_SUSTAIN_LEVEL_SHIFT: u32 = 11;
+const ADSR_SUSTAIN_RATE_SHIFT: u16 = 6;
+const ADSR_SUSTAIN_DECREASE_BIT: u16 = 0x4000;
+const ADSR_RELEASE_RATE_MASK: u16 = 0x1f;
+const ADSR_RELEASE_EXPONENTIAL_BIT: u16 = 0x0020;
+const ADSR_RATE_MAX: u32 = 127;
+const ADSR_RATE_DIVISOR: i32 = 4;
+const ADSR_SHIFT_BASE: i32 = 11;
+const ADSR_WAIT_RATE_OFFSET: i32 = 44;
 
 // ADPCM prediction filter coefficients × 64
 const FILTER_POS: [i32; 5] = [0, 60, 115, 98, 122];
@@ -27,7 +67,7 @@ struct Voice {
     vol_left: i16,
     vol_right: i16,
     pitch: u16,
-    adpcm_start: u32,  // SPU RAM byte address (reg value << 3)
+    adpcm_start: u32, // SPU RAM byte address (reg value << 3)
     adpcm_repeat: u32,
     adsr1: u16,
     adsr2: u16,
@@ -42,7 +82,7 @@ struct Voice {
     older: i32,
     current_addr: u32,
     sample_index: usize,
-    decoded: [i16; 28],
+    decoded: [i16; ADPCM_BLOCK_SAMPLES],
     pitch_counter: u32,
     loop_start: u32,
     flags: u8,
@@ -60,12 +100,12 @@ impl Voice {
             adsr2: 0,
             adsr_vol: 0,
             phase: AdsrPhase::Off,
-            adsr_counter: 1,
+            adsr_counter: ADSR_COUNTER_RELOAD,
             old: 0,
             older: 0,
             current_addr: 0,
-            sample_index: 28,
-            decoded: [0; 28],
+            sample_index: ADPCM_BLOCK_SAMPLES,
+            decoded: [0; ADPCM_BLOCK_SAMPLES],
             pitch_counter: 0,
             loop_start: 0,
             flags: 0,
@@ -74,19 +114,19 @@ impl Voice {
 
     fn key_on(&mut self) {
         self.current_addr = self.adpcm_start;
-        self.sample_index = 28;
+        self.sample_index = ADPCM_BLOCK_SAMPLES;
         self.old = 0;
         self.older = 0;
         self.phase = AdsrPhase::Attack;
         self.adsr_vol = 0;
-        self.adsr_counter = 1;
+        self.adsr_counter = ADSR_COUNTER_RELOAD;
         self.pitch_counter = 0;
     }
 
     fn key_off(&mut self) {
         if self.phase != AdsrPhase::Off {
             self.phase = AdsrPhase::Release;
-            self.adsr_counter = 1;
+            self.adsr_counter = ADSR_COUNTER_RELOAD;
         }
     }
 
@@ -95,18 +135,24 @@ impl Voice {
         let shift_filter = ram[addr];
         self.flags = ram[addr + 1];
 
-        let shift = (shift_filter & 0x0f) as i32;
-        let filter = ((shift_filter >> 4) & 0x07) as usize;
-        let filter = filter.min(4);
+        let shift = (shift_filter & ADPCM_SHIFT_MASK) as i32;
+        let filter = ((shift_filter >> ADPCM_FILTER_SHIFT) & ADPCM_FILTER_MASK) as usize;
+        let filter = filter.min(ADPCM_MAX_FILTER);
         let f0 = FILTER_POS[filter];
         let f1 = FILTER_NEG[filter];
 
-        for i in 0..14usize {
-            let byte = ram[(addr + 2 + i) & (SPU_RAM_SIZE - 1)] as i32;
-            let nibbles = [byte & 0x0f, byte >> 4];
+        for i in 0..ADPCM_DATA_BYTES {
+            let byte = ram[(addr + ADPCM_HEADER_BYTES + i) & (SPU_RAM_SIZE - 1)] as i32;
+            let nibbles = [byte & ADPCM_NIBBLE_MASK, byte >> ADPCM_FILTER_SHIFT];
             for (j, raw_nibble) in nibbles.iter().enumerate() {
-                let nibble = if *raw_nibble >= 8 { raw_nibble - 16 } else { *raw_nibble };
-                let sample = ((nibble << 12) >> shift) + (self.old * f0 + self.older * f1 + 32) / 64;
+                let nibble = if *raw_nibble >= ADPCM_SIGNED_NIBBLE_THRESHOLD {
+                    raw_nibble - ADPCM_SIGN_EXTEND_BIAS
+                } else {
+                    *raw_nibble
+                };
+                let sample = ((nibble << ADPCM_SAMPLE_SHIFT) >> shift)
+                    + (self.old * f0 + self.older * f1 + ADPCM_FILTER_ROUNDING)
+                        / ADPCM_FILTER_SCALE;
                 let sample = sample.clamp(-32768, 32767);
                 self.decoded[i * 2 + j] = sample as i16;
                 self.older = self.old;
@@ -114,14 +160,14 @@ impl Voice {
             }
         }
 
-        if self.flags & 0x04 != 0 {
+        if self.flags & ADPCM_LOOP_START_FLAG != 0 {
             self.loop_start = self.current_addr;
         }
 
-        self.current_addr = (self.current_addr + 16) & (SPU_RAM_SIZE as u32 - 1);
+        self.current_addr = (self.current_addr + ADPCM_BLOCK_BYTES) & (SPU_RAM_SIZE as u32 - 1);
 
-        if self.flags & 0x01 != 0 {
-            if self.flags & 0x02 != 0 {
+        if self.flags & ADPCM_END_FLAG != 0 {
+            if self.flags & ADPCM_REPEAT_FLAG != 0 {
                 self.current_addr = self.adpcm_repeat;
             } else {
                 self.phase = AdsrPhase::Off;
@@ -137,24 +183,24 @@ impl Voice {
         }
 
         self.pitch_counter += self.pitch as u32;
-        let steps = (self.pitch_counter >> 12) as usize;
-        self.pitch_counter &= 0xfff;
+        let steps = (self.pitch_counter >> PITCH_COUNTER_FRACTION_BITS) as usize;
+        self.pitch_counter &= PITCH_COUNTER_MASK;
 
         for _ in 0..steps {
             self.sample_index += 1;
-            if self.sample_index >= 28 {
+            if self.sample_index >= ADPCM_BLOCK_SAMPLES {
                 self.decode_block(ram);
                 self.sample_index = 0;
             }
         }
 
-        if self.sample_index >= 28 {
+        if self.sample_index >= ADPCM_BLOCK_SAMPLES {
             return 0;
         }
 
         let raw = self.decoded[self.sample_index];
         let vol = self.adsr_vol as i32;
-        ((raw as i32 * vol) >> 15) as i16
+        ((raw as i32 * vol) >> ADSR_VOLUME_FRACTION_BITS) as i16
     }
 
     fn tick_adsr(&mut self) {
@@ -165,56 +211,70 @@ impl Voice {
 
         match self.phase {
             AdsrPhase::Off => {
-                self.adsr_counter = 1;
+                self.adsr_counter = ADSR_COUNTER_RELOAD;
             }
             AdsrPhase::Attack => {
-                let rate = ((self.adsr1 >> 8) & 0x7f) as u32;
-                let exp = (self.adsr1 & 0x8000) != 0;
+                let rate = ((self.adsr1 >> ADSR_ATTACK_RATE_SHIFT) & ADSR_RATE_MASK) as u32;
+                let exp = (self.adsr1 & ADSR_EXPONENTIAL_BIT) != 0;
                 let (step, wait) = adsr_rate(rate, false);
-                let step = if exp && self.adsr_vol > 0x6000 { step >> 2 } else { step };
-                self.adsr_vol = (self.adsr_vol as i32 + step).clamp(0, 0x7fff) as i16;
-                self.adsr_counter = wait;
-                if self.adsr_vol >= 0x7fff {
-                    self.adsr_vol = 0x7fff;
-                    self.phase = AdsrPhase::Decay;
-                    self.adsr_counter = 1;
-                }
-            }
-            AdsrPhase::Decay => {
-                let dr = (self.adsr1 >> 4) & 0x0f;
-                let rate = (dr << 2) | 0x18;
-                let (step, wait) = adsr_rate(rate as u32, true);
-                let step = (step * self.adsr_vol as i32) >> 15;
-                self.adsr_vol = (self.adsr_vol as i32 + step).clamp(0, 0x7fff) as i16;
-                self.adsr_counter = wait;
-                let sustain_level = (((self.adsr1 & 0x0f) as i32 + 1) << 11).min(0x7fff);
-                if (self.adsr_vol as i32) <= sustain_level {
-                    self.adsr_vol = sustain_level as i16;
-                    self.phase = AdsrPhase::Sustain;
-                    self.adsr_counter = 1;
-                }
-            }
-            AdsrPhase::Sustain => {
-                let rate = ((self.adsr2 >> 6) & 0x7f) as u32;
-                let exp = (self.adsr2 & 0x8000) != 0;
-                let dec = (self.adsr2 & 0x4000) != 0;
-                let (step, wait) = adsr_rate(rate, dec);
-                let step = if exp && dec {
-                    (step * self.adsr_vol as i32) >> 15
-                } else if exp && !dec && self.adsr_vol > 0x6000 {
+                let step = if exp && self.adsr_vol > ADSR_EXP_THRESHOLD {
                     step >> 2
                 } else {
                     step
                 };
-                self.adsr_vol = (self.adsr_vol as i32 + step).clamp(0, 0x7fff) as i16;
+                self.adsr_vol =
+                    (self.adsr_vol as i32 + step).clamp(0, ADSR_MAX_VOLUME as i32) as i16;
+                self.adsr_counter = wait;
+                if self.adsr_vol >= ADSR_MAX_VOLUME {
+                    self.adsr_vol = ADSR_MAX_VOLUME;
+                    self.phase = AdsrPhase::Decay;
+                    self.adsr_counter = ADSR_COUNTER_RELOAD;
+                }
+            }
+            AdsrPhase::Decay => {
+                let dr = (self.adsr1 >> ADSR_DECAY_RATE_SHIFT) & ADSR_DECAY_RATE_MASK;
+                let rate = (dr << 2) | ADSR_DECAY_RATE_BASE;
+                let (step, wait) = adsr_rate(rate as u32, true);
+                let step = (step * self.adsr_vol as i32) >> ADSR_VOLUME_FRACTION_BITS;
+                self.adsr_vol =
+                    (self.adsr_vol as i32 + step).clamp(0, ADSR_MAX_VOLUME as i32) as i16;
+                self.adsr_counter = wait;
+                let sustain_level = (((self.adsr1 & ADSR_SUSTAIN_LEVEL_MASK) as i32 + 1)
+                    << ADSR_SUSTAIN_LEVEL_SHIFT)
+                    .min(ADSR_MAX_VOLUME as i32);
+                if (self.adsr_vol as i32) <= sustain_level {
+                    self.adsr_vol = sustain_level as i16;
+                    self.phase = AdsrPhase::Sustain;
+                    self.adsr_counter = ADSR_COUNTER_RELOAD;
+                }
+            }
+            AdsrPhase::Sustain => {
+                let rate = ((self.adsr2 >> ADSR_SUSTAIN_RATE_SHIFT) & ADSR_RATE_MASK) as u32;
+                let exp = (self.adsr2 & ADSR_EXPONENTIAL_BIT) != 0;
+                let dec = (self.adsr2 & ADSR_SUSTAIN_DECREASE_BIT) != 0;
+                let (step, wait) = adsr_rate(rate, dec);
+                let step = if exp && dec {
+                    (step * self.adsr_vol as i32) >> ADSR_VOLUME_FRACTION_BITS
+                } else if exp && !dec && self.adsr_vol > ADSR_EXP_THRESHOLD {
+                    step >> 2
+                } else {
+                    step
+                };
+                self.adsr_vol =
+                    (self.adsr_vol as i32 + step).clamp(0, ADSR_MAX_VOLUME as i32) as i16;
                 self.adsr_counter = wait;
             }
             AdsrPhase::Release => {
-                let rate = (self.adsr2 & 0x1f) as u32;
-                let exp = (self.adsr2 & 0x0020) != 0;
+                let rate = (self.adsr2 & ADSR_RELEASE_RATE_MASK) as u32;
+                let exp = (self.adsr2 & ADSR_RELEASE_EXPONENTIAL_BIT) != 0;
                 let (step, wait) = adsr_rate(rate << 2, true);
-                let step = if exp { (step * self.adsr_vol as i32) >> 15 } else { step };
-                self.adsr_vol = (self.adsr_vol as i32 + step).clamp(0, 0x7fff) as i16;
+                let step = if exp {
+                    (step * self.adsr_vol as i32) >> ADSR_VOLUME_FRACTION_BITS
+                } else {
+                    step
+                };
+                self.adsr_vol =
+                    (self.adsr_vol as i32 + step).clamp(0, ADSR_MAX_VOLUME as i32) as i16;
                 self.adsr_counter = wait;
                 if self.adsr_vol == 0 {
                     self.phase = AdsrPhase::Off;
@@ -226,20 +286,15 @@ impl Voice {
 
 // Returns (signed_step, wait_samples) for a given ADSR rate value (0-127).
 fn adsr_rate(rate: u32, decreasing: bool) -> (i32, i32) {
-    let rate = rate.min(127);
-    let shift = 11i32.saturating_sub(rate as i32 / 4).max(0);
+    let rate = rate.min(ADSR_RATE_MAX);
+    let shift = ADSR_SHIFT_BASE
+        .saturating_sub(rate as i32 / ADSR_RATE_DIVISOR)
+        .max(0);
     let base = 1i32 << shift;
     let step = if decreasing { -base } else { base };
-    let wait = 1i32.max(1 << ((rate as i32 - 44).max(0) / 4));
+    let wait = 1i32.max(1 << ((rate as i32 - ADSR_WAIT_RATE_OFFSET).max(0) / ADSR_RATE_DIVISOR));
     (step, wait)
 }
-
-// Wrapper so cpal::Stream (which may not be Send on all platforms) can be
-// stored in Bus, which lives entirely on the main thread.
-struct HoldStream(cpal::Stream);
-// Safety: the stream is only accessed from the main thread (start/stop);
-// the audio callback runs on a cpal-internal thread but does not touch this wrapper.
-unsafe impl Send for HoldStream {}
 
 pub struct Spu {
     pub ram: Box<[u8; SPU_RAM_SIZE]>,
@@ -261,12 +316,14 @@ pub struct Spu {
     reverb_regs: [u16; 32],
     tick_counter: u32,
     audio_buf: Arc<Mutex<VecDeque<i16>>>,
-    _stream: Option<HoldStream>,
+    _stream: Option<cpal::Stream>,
 }
 
 impl Spu {
     pub fn new() -> Self {
-        let audio_buf: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_SAMPLES * 2)));
+        let audio_buf: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
+            AUDIO_BUFFER_SAMPLES * 2,
+        )));
         let stream = Self::start_audio(Arc::clone(&audio_buf));
 
         let voices = std::array::from_fn(|_| Voice::new());
@@ -294,7 +351,7 @@ impl Spu {
             reverb_regs: [0; 32],
             tick_counter: 0,
             audio_buf,
-            _stream: stream.map(HoldStream),
+            _stream: stream,
         }
     }
 
@@ -325,13 +382,12 @@ impl Spu {
         Some(stream)
     }
 
-    pub fn tick(&mut self) {
-        self.tick_counter += 1;
-        if self.tick_counter < TICKS_PER_SAMPLE {
-            return;
+    pub fn tick(&mut self, cycles: u32) {
+        self.tick_counter = self.tick_counter.saturating_add(cycles);
+        while self.tick_counter >= TICKS_PER_SAMPLE {
+            self.tick_counter -= TICKS_PER_SAMPLE;
+            self.generate_sample();
         }
-        self.tick_counter = 0;
-        self.generate_sample();
     }
 
     fn generate_sample(&mut self) {
@@ -411,11 +467,11 @@ impl Spu {
             0x0 => voice.vol_left as u16,
             0x2 => voice.vol_right as u16,
             0x4 => voice.pitch,
-            0x6 => (voice.adpcm_start >> 3) as u16,
+            0x6 => (voice.adpcm_start >> SPU_ADDRESS_SHIFT) as u16,
             0x8 => voice.adsr1,
             0xa => voice.adsr2,
             0xc => voice.adsr_vol as u16,
-            0xe => (voice.adpcm_repeat >> 3) as u16,
+            0xe => (voice.adpcm_repeat >> SPU_ADDRESS_SHIFT) as u16,
             _ => 0,
         }
     }
@@ -444,8 +500,8 @@ impl Spu {
             0x198 => self.reverb_mode = (self.reverb_mode & 0xffff_0000) | value as u32,
             0x19a => self.reverb_mode = (self.reverb_mode & 0x0000_ffff) | ((value as u32) << 16),
             0x19c | 0x19e => {} // endx is read-only
-            0x1a2 => self.irq_addr = (value as u32) << 3,
-            0x1a4 => self.transfer_addr = (value as u32) << 3,
+            0x1a2 => self.irq_addr = (value as u32) << SPU_ADDRESS_SHIFT,
+            0x1a4 => self.transfer_addr = (value as u32) << SPU_ADDRESS_SHIFT,
             0x1a8 => self.fifo_write(value),
             0x1aa => {
                 self.control = value;
@@ -468,11 +524,11 @@ impl Spu {
             0x0 => voice.vol_left = value as i16,
             0x2 => voice.vol_right = value as i16,
             0x4 => voice.pitch = value,
-            0x6 => voice.adpcm_start = (value as u32) << 3,
+            0x6 => voice.adpcm_start = (value as u32) << SPU_ADDRESS_SHIFT,
             0x8 => voice.adsr1 = value,
             0xa => voice.adsr2 = value,
             0xc => voice.adsr_vol = value as i16,
-            0xe => voice.adpcm_repeat = (value as u32) << 3,
+            0xe => voice.adpcm_repeat = (value as u32) << SPU_ADDRESS_SHIFT,
             _ => {}
         }
     }
