@@ -7,7 +7,7 @@ BIOS ?= $(ROOT)SCPH1001.BIN
 GAME ?= doom
 STEPS ?= 20000
 FRAME ?= frame.ppm
-BOOT ?= --bios-boot
+BIOS_BOOT ?= --bios-boot
 
 DOOM_ARCHIVE := $(ROOT)Doom.7z
 DOOM_CUE := $(ROOT)Doom.cue
@@ -38,10 +38,10 @@ prepare-ace:
 run: run-$(GAME)
 
 run-doom: prepare-doom
-	$(CARGO) run -- "$(BIOS)" "$(DOOM_CUE)" "$(STEPS)" $(BOOT)
+	$(CARGO) run -- "$(BIOS)" "$(DOOM_CUE)" "$(STEPS)"
 
 run-ace: prepare-ace
-	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" "$(STEPS)" $(BOOT)
+	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" "$(STEPS)"
 
 window: window-$(GAME)
 
@@ -49,7 +49,19 @@ window-doom: prepare-doom
 	$(CARGO) run -- "$(BIOS)" "$(DOOM_CUE)" --window
 
 window-ace: prepare-ace
-	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" --window $(BOOT)
+	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" --window
+
+run-doom-bios: prepare-doom
+	$(CARGO) run -- "$(BIOS)" "$(DOOM_CUE)" "$(STEPS)" $(BIOS_BOOT)
+
+run-ace-bios: prepare-ace
+	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" "$(STEPS)" $(BIOS_BOOT)
+
+window-doom-bios: prepare-doom
+	$(CARGO) run -- "$(BIOS)" "$(DOOM_CUE)" --window $(BIOS_BOOT)
+
+window-ace-bios: prepare-ace
+	$(CARGO) run -- "$(BIOS)" "$(ACE_CUE)" --window $(BIOS_BOOT)
 
 dump-frame: prepare-$(GAME)
 	PS1_DUMP_FRAME="$(FRAME)" $(MAKE) run GAME="$(GAME)" STEPS="$(STEPS)"

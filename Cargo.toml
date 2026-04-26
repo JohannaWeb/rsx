@@ -10,4 +10,11 @@ log = "0.4.22"
 fern = "0.7"
 chrono = "0.4"
 env_logger = "0.11.3"
-cpal = "0.15"
+
+[features]
+default = []
+audio = ["cpal"]
+
+[dependencies.cpal]
+version = "0.15"
+optional = true

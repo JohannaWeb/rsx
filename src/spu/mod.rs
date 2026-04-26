@@ -1,11 +1,15 @@
+#[cfg(feature = "audio")]
 use std::collections::VecDeque;
+#[cfg(feature = "audio")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "audio")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 pub const SPU_RAM_SIZE: usize = 512 * 1024;
 const VOICE_COUNT: usize = 24;
 const TICKS_PER_SAMPLE: u32 = 768; // 33_868_800 Hz / 44100 Hz ≈ 768
+#[cfg(feature = "audio")]
 const AUDIO_BUFFER_SAMPLES: usize = 4096;
 const ADPCM_BLOCK_BYTES: u32 = 16;
 const ADPCM_BLOCK_SAMPLES: usize = 28;
@@ -47,6 +51,15 @@ const ADSR_RATE_MAX: u32 = 127;
 const ADSR_RATE_DIVISOR: i32 = 4;
 const ADSR_SHIFT_BASE: i32 = 11;
 const ADSR_WAIT_RATE_OFFSET: i32 = 44;
+const SPU_STATUS_SECOND_HALF_CAPTURE_BUFFER: u16 = 1 << 11;
+const SPU_STATUS_TRANSFER_BUSY: u16 = 1 << 10;
+const SPU_STATUS_DMA_WRITE_REQUEST: u16 = 1 << 9;
+const SPU_STATUS_DMA_READ_REQUEST: u16 = 1 << 8;
+const SPU_STATUS_DMA_REQUEST: u16 = 1 << 7;
+const SPU_STATUS_IRQ9_FLAG: u16 = 1 << 6;
+const SPU_STATUS_MODE_MASK: u16 = 0x003f;
+const SPU_TRANSFER_MODE_MASK: u16 = 0x0007;
+const SPU_TRANSFER_MODE_SHIFT: u16 = 1;
 
 // ADPCM prediction filter coefficients × 64
 const FILTER_POS: [i32; 5] = [0, 60, 115, 98, 122];
@@ -315,15 +328,19 @@ pub struct Spu {
     cd_vol_right: i16,
     reverb_regs: [u16; 32],
     tick_counter: u32,
+    #[cfg(feature = "audio")]
     audio_buf: Arc<Mutex<VecDeque<i16>>>,
+    #[cfg(feature = "audio")]
     _stream: Option<cpal::Stream>,
 }
 
 impl Spu {
     pub fn new() -> Self {
+        #[cfg(feature = "audio")]
         let audio_buf: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
             AUDIO_BUFFER_SAMPLES * 2,
         )));
+        #[cfg(feature = "audio")]
         let stream = Self::start_audio(Arc::clone(&audio_buf));
 
         let voices = std::array::from_fn(|_| Voice::new());
@@ -350,11 +367,14 @@ impl Spu {
             cd_vol_right: 0,
             reverb_regs: [0; 32],
             tick_counter: 0,
+            #[cfg(feature = "audio")]
             audio_buf,
+            #[cfg(feature = "audio")]
             _stream: stream,
         }
     }
 
+    #[cfg(feature = "audio")]
     fn start_audio(buf: Arc<Mutex<VecDeque<i16>>>) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
@@ -382,6 +402,18 @@ impl Spu {
         Some(stream)
     }
 
+    #[cfg(feature = "audio")]
+    fn push_audio_sample(&mut self, left: i32, right: i32) {
+        let mut guard = self.audio_buf.lock().unwrap();
+        if guard.len() < AUDIO_BUFFER_SAMPLES * 2 {
+            guard.push_back(left as i16);
+            guard.push_back(right as i16);
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn push_audio_sample(&mut self, _left: i32, _right: i32) {}
+
     pub fn tick(&mut self, cycles: u32) {
         self.tick_counter = self.tick_counter.saturating_add(cycles);
         while self.tick_counter >= TICKS_PER_SAMPLE {
@@ -407,11 +439,7 @@ impl Spu {
         left = (left * self.main_vol_left as i32 / 0x4000).clamp(-32768, 32767);
         right = (right * self.main_vol_right as i32 / 0x4000).clamp(-32768, 32767);
 
-        let mut guard = self.audio_buf.lock().unwrap();
-        if guard.len() < AUDIO_BUFFER_SAMPLES * 2 {
-            guard.push_back(left as i16);
-            guard.push_back(right as i16);
-        }
+        self.push_audio_sample(left, right);
     }
 
     pub fn read16(&self, addr: u32) -> u16 {
@@ -505,9 +533,12 @@ impl Spu {
             0x1a8 => self.fifo_write(value),
             0x1aa => {
                 self.control = value;
-                self.status = value & 0x3f;
+                self.refresh_status();
             }
-            0x1ac => self.transfer_ctrl = value,
+            0x1ac => {
+                self.transfer_ctrl = value;
+                self.refresh_status();
+            }
             0x1b0 => self.cd_vol_left = value as i16,
             0x1b2 => self.cd_vol_right = value as i16,
             0x1c0..=0x1fe => {
@@ -556,6 +587,7 @@ impl Spu {
         self.ram[addr] = lo;
         self.ram[(addr + 1) & (SPU_RAM_SIZE - 1)] = hi;
         self.transfer_addr = (self.transfer_addr + 2) & (SPU_RAM_SIZE as u32 - 1);
+        self.refresh_status();
     }
 
     pub fn dma_write(&mut self, words: impl Iterator<Item = u32>) {
@@ -566,6 +598,7 @@ impl Spu {
                 self.transfer_addr = (self.transfer_addr + 1) & (SPU_RAM_SIZE as u32 - 1);
             }
         }
+        self.refresh_status();
     }
 
     pub fn dma_read(&mut self, count: usize) -> Vec<u32> {
@@ -581,6 +614,26 @@ impl Spu {
             out.push(word);
             self.transfer_addr = (self.transfer_addr + 4) & (SPU_RAM_SIZE as u32 - 1);
         }
+        self.refresh_status();
         out
+    }
+
+    fn refresh_status(&mut self) {
+        let mut status = self.control & SPU_STATUS_MODE_MASK;
+        let transfer_mode =
+            (self.transfer_ctrl & SPU_TRANSFER_MODE_MASK) >> SPU_TRANSFER_MODE_SHIFT;
+
+        if transfer_mode != 0 {
+            status |= SPU_STATUS_TRANSFER_BUSY | SPU_STATUS_DMA_REQUEST;
+        }
+        if transfer_mode == 2 {
+            status |= SPU_STATUS_DMA_WRITE_REQUEST;
+        } else if transfer_mode == 3 {
+            status |= SPU_STATUS_DMA_READ_REQUEST;
+        }
+
+        status &= !SPU_STATUS_SECOND_HALF_CAPTURE_BUFFER;
+        status &= !SPU_STATUS_IRQ9_FLAG;
+        self.status = status;
     }
 }

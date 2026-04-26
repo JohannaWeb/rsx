@@ -5,6 +5,7 @@ use crate::cpu::{
 };
 use crate::cpu::{branch_target, imm, jump_target, rd, rs, rt, shamt, unsigned_imm};
 use crate::cpu::{load_word_left, load_word_right, store_word_left, store_word_right};
+use crate::error::Error;
 use crate::error::Result;
 
 pub type InstructionHandler = fn(&mut Cpu, u32, u32, &mut CpuBusAccess) -> Result<()>;
@@ -19,6 +20,10 @@ pub const PRIMARY_OPCODE_TABLE: [InstructionHandler; 64] = {
     table[PrimaryOpcode::Bne as usize] = Cpu::op_bne;
     table[PrimaryOpcode::Blez as usize] = Cpu::op_blez;
     table[PrimaryOpcode::Bgtz as usize] = Cpu::op_bgtz;
+    table[PrimaryOpcode::Beql as usize] = Cpu::op_beql;
+    table[PrimaryOpcode::Bnel as usize] = Cpu::op_bnel;
+    table[PrimaryOpcode::Blezl as usize] = Cpu::op_blezl;
+    table[PrimaryOpcode::Bgtzl as usize] = Cpu::op_bgtzl;
     table[PrimaryOpcode::Addi as usize] = Cpu::op_addi;
     table[PrimaryOpcode::Addiu as usize] = Cpu::op_addiu;
     table[PrimaryOpcode::Slti as usize] = Cpu::op_slti;
@@ -28,7 +33,9 @@ pub const PRIMARY_OPCODE_TABLE: [InstructionHandler; 64] = {
     table[PrimaryOpcode::Xori as usize] = Cpu::op_xori;
     table[PrimaryOpcode::Lui as usize] = Cpu::op_lui;
     table[PrimaryOpcode::Cop0 as usize] = Cpu::op_cop0;
+    table[0x11] = Cpu::op_cop1;
     table[PrimaryOpcode::Cop2 as usize] = Cpu::op_cop2;
+    table[0x13] = Cpu::op_cop3;
     table[PrimaryOpcode::Lb as usize] = Cpu::op_lb;
     table[PrimaryOpcode::Lh as usize] = Cpu::op_lh;
     table[PrimaryOpcode::Lwl as usize] = Cpu::op_lwl;
@@ -204,6 +211,26 @@ impl Cpu {
         Ok(())
     }
 
+    pub(super) fn op_cop1(
+        &mut self,
+        pc: u32,
+        _instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        self.enter_exception(pc, 0x0b);
+        Ok(())
+    }
+
+    pub(super) fn op_cop3(
+        &mut self,
+        pc: u32,
+        _instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        self.enter_exception(pc, 0x0b);
+        Ok(())
+    }
+
     pub(super) fn op_lwc2(
         &mut self,
         _pc: u32,
@@ -213,8 +240,11 @@ impl Cpu {
         let base = ((instruction >> 21) & 0x1f) as usize;
         let rt = ((instruction >> 16) & 0x1f) as usize;
         let address = self.reg(base).wrapping_add(instruction as i16 as u32);
-        let value = bus.read32(address)?;
-        self.gte.write_data(rt, value);
+        match bus.read32(address) {
+            Ok(value) => self.gte.write_data(rt, value),
+            Err(Error::UnalignedAccess { .. }) => self.enter_exception(self.pc, 0x04),
+            Err(err) => return Err(err),
+        }
         Ok(())
     }
 
@@ -227,7 +257,14 @@ impl Cpu {
         let base = ((instruction >> 21) & 0x1f) as usize;
         let rt = ((instruction >> 16) & 0x1f) as usize;
         let address = self.reg(base).wrapping_add(instruction as i16 as u32);
-        bus.write32(address, self.gte.read_data(rt))
+        match bus.write32(address, self.gte.read_data(rt)) {
+            Ok(()) => Ok(()),
+            Err(Error::UnalignedAccess { .. }) => {
+                self.enter_exception(self.pc, 0x05);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(super) fn op_j(
@@ -295,6 +332,67 @@ impl Cpu {
     ) -> Result<()> {
         if (self.reg(rs(instruction)) as i32) > 0 {
             self.next_pc = branch_target(self.pc, imm(instruction));
+        }
+        Ok(())
+    }
+
+    fn skip_branch_delay_slot(&mut self) {
+        self.pc = self.next_pc;
+        self.next_pc = self.next_pc.wrapping_add(4);
+    }
+
+    pub(super) fn op_beql(
+        &mut self,
+        _pc: u32,
+        instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        if self.reg(rs(instruction)) == self.reg(rt(instruction)) {
+            self.next_pc = branch_target(self.pc, imm(instruction));
+        } else {
+            self.skip_branch_delay_slot();
+        }
+        Ok(())
+    }
+
+    pub(super) fn op_bnel(
+        &mut self,
+        _pc: u32,
+        instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        if self.reg(rs(instruction)) != self.reg(rt(instruction)) {
+            self.next_pc = branch_target(self.pc, imm(instruction));
+        } else {
+            self.skip_branch_delay_slot();
+        }
+        Ok(())
+    }
+
+    pub(super) fn op_blezl(
+        &mut self,
+        _pc: u32,
+        instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        if (self.reg(rs(instruction)) as i32) <= 0 {
+            self.next_pc = branch_target(self.pc, imm(instruction));
+        } else {
+            self.skip_branch_delay_slot();
+        }
+        Ok(())
+    }
+
+    pub(super) fn op_bgtzl(
+        &mut self,
+        _pc: u32,
+        instruction: u32,
+        _bus: &mut CpuBusAccess,
+    ) -> Result<()> {
+        if (self.reg(rs(instruction)) as i32) > 0 {
+            self.next_pc = branch_target(self.pc, imm(instruction));
+        } else {
+            self.skip_branch_delay_slot();
         }
         Ok(())
     }
@@ -442,7 +540,11 @@ impl Cpu {
         let address = self
             .reg(rs(instruction))
             .wrapping_add(imm(instruction) as u32);
-        self.stage_load(rt(instruction), bus.read32(address)?);
+        match bus.read32(address) {
+            Ok(value) => self.stage_load(rt(instruction), value),
+            Err(Error::UnalignedAccess { .. }) => self.enter_exception(self.pc, 0x04),
+            Err(err) => return Err(err),
+        }
         Ok(())
     }
 
@@ -531,7 +633,14 @@ impl Cpu {
         let address = self
             .reg(rs(instruction))
             .wrapping_add(imm(instruction) as u32);
-        bus.write32(address, self.reg(rt(instruction)))
+        match bus.write32(address, self.reg(rt(instruction))) {
+            Ok(()) => Ok(()),
+            Err(Error::UnalignedAccess { .. }) => {
+                self.enter_exception(self.pc, 0x05);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(super) fn op_swr(
