@@ -1,11 +1,16 @@
 /target
-**/*.bin
-**/*.BIN
-**/*.7z
-**/*.ppm
-**/*.cue
 .idea/
-.codex/
-.codex
-ps1.log
-Cargo.lock
+/.codex/
+/.codex
+/codex/
+
+# Local BIOS, disc images, extracted tracks, logs, and framebuffer dumps.
+/bios/
+/games/
+/artifacts/
+*.bin
+*.BIN
+*.7z
+*.cue
+*.ppm
+*.log

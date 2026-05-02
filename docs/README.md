@@ -24,27 +24,27 @@ cargo build --release
 
 ### Run a game from CD image:
 ```bash
-./ps1_emulator bios.bin game.cue
+./ps1_emulator bios/SCPH1001.BIN games/game.cue
 ```
 
 ### Run a standalone EXE:
 ```bash
-./ps1_emulator bios.bin game.exe
+./ps1_emulator bios/SCPH1001.BIN games/game.exe
 ```
 
 ### Boot through BIOS (no fast boot):
 ```bash
-./ps1_emulator bios.bin game.cue --bios-boot
+./ps1_emulator bios/SCPH1001.BIN games/game.cue --bios-boot
 ```
 
 ### Run with window display:
 ```bash
-./ps1_emulator bios.bin game.cue --window
+./ps1_emulator bios/SCPH1001.BIN games/game.cue --window
 ```
 
 ### Run for a specific number of CPU steps:
 ```bash
-./ps1_emulator bios.bin game.cue 1000000
+./ps1_emulator bios/SCPH1001.BIN games/game.cue 1000000
 ```
 
 ## Debug Options
@@ -57,6 +57,11 @@ Set environment variables for debugging:
 - `PS1_DUMP_PC=1` - Dump PC-relative memory on errors
 - `PS1_DUMP_FRAME=<path>` - Save framebuffer to PPM file on exit
 - `PS1_DUMP_WORDS=<addr>:<count>` - Dump memory words at address
+- `PS1_LOG_FILE=<path>` - Write logs to a custom file path
+
+## Local Assets
+
+Keep local BIOS files in `bios/`, game images in `games/`, and generated logs or framebuffer dumps in `artifacts/`. These directories are ignored by Git.
 
 ## Project Structure
 

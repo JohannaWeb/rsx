@@ -179,7 +179,13 @@ fn init_logger() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(log::LevelFilter::Warn);
 
-    let file = fern::log_file("ps1.log").expect("failed to open ps1.log");
+    let log_path = std::env::var_os("PS1_LOG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("artifacts/logs/ps1.log"));
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create log directory");
+    }
+    let file = fern::log_file(&log_path).expect("failed to open log file");
 
     fern::Dispatch::new()
         .format(|out, message, record| {
