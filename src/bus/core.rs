@@ -1,3 +1,4 @@
+
 use super::timers::SystemTimers;
 use crate::bios::Bios;
 use crate::cdrom::{CDROM_INDEX_ADDRESS, CdImage, CdRomController, CdRomDebugState};
@@ -45,6 +46,10 @@ const INTERRUPT_STATUS_OFFSET: usize = 0x70;
 const INTERRUPT_MASK_OFFSET: usize = 0x74;
 const VBLANK_INTERRUPT_BIT: u32 = 1;
 const CDROM_INTERRUPT_BIT: u32 = 1 << 2;
+const TIMER_INTERRUPT_BITS: [u32; ROOT_COUNTER_COUNT] = [1 << 4, 1 << 5, 1 << 6];
+const ROOT_COUNTER_MODE_OFFSET: usize = 4;
+const ROOT_COUNTER_TARGET_OFFSET: usize = 8;
+const ROOT_COUNTER_REGISTER_BYTES: usize = 2;
 #[cfg(test)]
 pub(crate) const VBLANK_INTERVAL_TICKS: u32 = super::timers::VBLANK_INTERVAL_CYCLES;
 const GPU_LINKED_LIST_DMA_PACKET_LIMIT: usize = 4096;
@@ -167,6 +172,12 @@ impl Bus {
         if self.timers.take_vblank_interrupt() {
             self.irq_status |= VBLANK_INTERRUPT_BIT;
             self.sync_irq_status_io();
+        }
+        for (counter, bit) in TIMER_INTERRUPT_BITS.into_iter().enumerate() {
+            if self.timers.take_counter_interrupt(counter) {
+                self.irq_status |= bit;
+                self.sync_irq_status_io();
+            }
         }
 
         self.cdrom.tick(cycles);
@@ -646,9 +657,25 @@ impl Bus {
         self.io[offset] = value;
         for counter in 0..ROOT_COUNTER_COUNT {
             let base = ROOT_COUNTER_BASE_OFFSET + counter * ROOT_COUNTER_STRIDE;
-            if offset == base || offset == base + 1 {
+            let value_range = base..base + ROOT_COUNTER_REGISTER_BYTES;
+            let mode_range = base + ROOT_COUNTER_MODE_OFFSET
+                ..base + ROOT_COUNTER_MODE_OFFSET + ROOT_COUNTER_REGISTER_BYTES;
+            let target_range = base + ROOT_COUNTER_TARGET_OFFSET
+                ..base + ROOT_COUNTER_TARGET_OFFSET + ROOT_COUNTER_REGISTER_BYTES;
+
+            if value_range.contains(&offset) {
                 self.timers
-                    .write_root_counter_byte(counter, offset - base, value);
+                    .write_root_counter_byte(counter, offset - value_range.start, value);
+                return;
+            }
+            if mode_range.contains(&offset) {
+                self.timers
+                    .write_counter_mode_byte(counter, offset - mode_range.start, value);
+                return;
+            }
+            if target_range.contains(&offset) {
+                self.timers
+                    .write_counter_target_byte(counter, offset - target_range.start, value);
                 return;
             }
         }
@@ -863,6 +890,7 @@ mod tests {
         bus.write8(0x1f80_1800, 0).unwrap();
         bus.write8(0x1f80_1801, CdRomCommand::GetStat.code())
             .unwrap();
+        bus.tick_cycles(crate::cdrom::CDROM_ACK_DELAY_TICKS);
 
         assert_ne!(bus.read32(0x1f80_1070).unwrap() & CDROM_INTERRUPT_BIT, 0);
         // PSYQ sync flag address
@@ -919,6 +947,66 @@ mod tests {
     }
 
     #[test]
+    fn timer_raises_irq_on_target_reached() {
+        let mut bus = bus();
+        const TIMER0_TARGET_ADDRESS: u32 = 0x1f80_1108;
+        const TIMER0_MODE_ADDRESS: u32 = 0x1f80_1104;
+        const TARGET_VALUE: u16 = 5;
+        const RESET_ON_TARGET_BIT: u32 = 1 << 3;
+        const IRQ_ON_TARGET_BIT: u32 = 1 << 4;
+
+        bus.write16(TIMER0_TARGET_ADDRESS, TARGET_VALUE).unwrap();
+        bus.write16(
+            TIMER0_MODE_ADDRESS,
+            (RESET_ON_TARGET_BIT | IRQ_ON_TARGET_BIT) as u16,
+        )
+        .unwrap();
+
+        for _ in 0..TARGET_VALUE {
+            bus.tick();
+        }
+
+        assert_ne!(
+            bus.read32(0x1f80_1070).unwrap() & TIMER_INTERRUPT_BITS[0],
+            0
+        );
+    }
+
+    #[test]
+    fn timer_one_shot_irq_does_not_refire_without_repeat_bit() {
+        let mut bus = bus();
+        const TIMER0_TARGET_ADDRESS: u32 = 0x1f80_1108;
+        const TIMER0_MODE_ADDRESS: u32 = 0x1f80_1104;
+        const TARGET_VALUE: u16 = 3;
+        const RESET_ON_TARGET_BIT: u32 = 1 << 3;
+        const IRQ_ON_TARGET_BIT: u32 = 1 << 4;
+
+        bus.write16(TIMER0_TARGET_ADDRESS, TARGET_VALUE).unwrap();
+        bus.write16(
+            TIMER0_MODE_ADDRESS,
+            (RESET_ON_TARGET_BIT | IRQ_ON_TARGET_BIT) as u16,
+        )
+        .unwrap();
+
+        for _ in 0..TARGET_VALUE {
+            bus.tick();
+        }
+        // Acknowledge the first IRQ.
+        bus.write32(0x1f80_1070, !TIMER_INTERRUPT_BITS[0]).unwrap();
+
+        // Run through several more full sweeps of the target without rearming
+        // the mode register (no repeat bit set): the IRQ must not refire.
+        for _ in 0..(TARGET_VALUE as u32 * 4) {
+            bus.tick();
+        }
+
+        assert_eq!(
+            bus.read32(0x1f80_1070).unwrap() & TIMER_INTERRUPT_BITS[0],
+            0
+        );
+    }
+
+    #[test]
     fn cdrom_dma_copies_sector_data_to_ram() {
         let mut bus = bus();
         let mut raw = vec![0; crate::cdrom::RAW_SECTOR_SIZE];
@@ -934,6 +1022,7 @@ mod tests {
         bus.load_cd_image(CdImage::from_raw_for_test(raw));
         bus.write8(0x1f80_1800, 0).unwrap();
         bus.write8(0x1f80_1801, CdRomCommand::ReadN.code()).unwrap();
+        bus.tick_cycles(crate::cdrom::CDROM_ACK_DELAY_TICKS);
         assert_eq!(bus.read8(0x1f80_1801).unwrap(), 0x22);
 
         bus.write32(0x1f80_10b0, 0x0000_2000).unwrap();

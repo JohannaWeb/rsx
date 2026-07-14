@@ -796,32 +796,59 @@ mod tests {
     #[test]
     fn enters_exception_when_interrupt_is_pending_and_enabled() {
         let mut cpu = Cpu::new();
-        cpu.set_pc(0);
-        cpu.cop0[COP0_STATUS] = 0x0000_0401;
-        let mut bus = bus_with_program(&[nop()]);
+        const INTERRUPTED_PC: u32 = 0x40;
+        // IRQ2 is the CD-ROM line; unmask it in COP0_STATUS's interrupt-mask field
+        // and enable the matching bit in I_MASK below so the interrupt fires.
+        const CDROM_IRQ_LINE: u32 = 2;
+        const CDROM_STATUS_MASK_BIT: u32 = 1 << (COP0_STATUS_INTERRUPT_MASK_SHIFT + CDROM_IRQ_LINE);
+        const INITIAL_STATUS: u32 = COP0_STATUS_INTERRUPT_ENABLE | CDROM_STATUS_MASK_BIT;
+        cpu.set_pc(INTERRUPTED_PC);
+        cpu.cop0[COP0_STATUS] = INITIAL_STATUS;
+        let mut bus = bus_with_program(&[nop(); (INTERRUPTED_PC / 4) as usize + 1]);
 
-        bus.write32(0x1f80_1074, 0x0000_0004).unwrap();
+        const I_MASK_ADDRESS: u32 = 0x1f80_1074;
+        const CDROM_IMASK_BIT: u32 = 1 << CDROM_IRQ_LINE;
+        bus.write32(I_MASK_ADDRESS, CDROM_IMASK_BIT).unwrap();
         bus.write8(0x1f80_1800, 1).unwrap();
         bus.write8(0x1f80_1802, 0x1f).unwrap();
         bus.write8(0x1f80_1800, 0).unwrap();
         bus.write8(0x1f80_1801, CdRomCommand::GetStat.code())
             .unwrap();
+        bus.tick_cycles(crate::cdrom::CDROM_ACK_DELAY_TICKS);
 
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.state().pc, EXCEPTION_VECTOR);
-        assert_eq!(cpu.cop0[COP0_EPC], 0);
-        assert_eq!(cpu.cop0[COP0_CAUSE], 1 << 10);
+        // EPC must record the interrupted PC so the handler can return to it;
+        // regressing to the old bug (writing pc into the Status slot instead)
+        // would leave this at 0 and corrupt COP0_STATUS below.
+        assert_eq!(cpu.cop0[COP0_EPC], INTERRUPTED_PC);
+        assert_eq!(
+            cpu.cop0[COP0_CAUSE],
+            CDROM_IMASK_BIT << COP0_CAUSE_INTERRUPT_PENDING_SHIFT
+        );
+        assert_eq!(
+            cpu.cop0[COP0_STATUS],
+            (INITIAL_STATUS & !COP0_STATUS_EXCEPTION_STACK_MASK)
+                | ((INITIAL_STATUS << 2) & COP0_STATUS_EXCEPTION_STACK_MASK)
+        );
     }
 
     #[test]
     fn enters_exception_for_vblank_interrupt() {
         let mut cpu = Cpu::new();
-        cpu.set_pc(0);
-        cpu.cop0[COP0_STATUS] = 0x0000_0101;
-        let mut bus = bus_with_program(&[nop()]);
+        const INTERRUPTED_PC: u32 = 0x40;
+        // IRQ0 is the VBlank line.
+        const VBLANK_IRQ_LINE: u32 = 0;
+        const VBLANK_STATUS_MASK_BIT: u32 = 1 << (COP0_STATUS_INTERRUPT_MASK_SHIFT + VBLANK_IRQ_LINE);
+        const INITIAL_STATUS: u32 = COP0_STATUS_INTERRUPT_ENABLE | VBLANK_STATUS_MASK_BIT;
+        cpu.set_pc(INTERRUPTED_PC);
+        cpu.cop0[COP0_STATUS] = INITIAL_STATUS;
+        let mut bus = bus_with_program(&[nop(); (INTERRUPTED_PC / 4) as usize + 1]);
 
-        bus.write32(0x1f80_1074, 0x0000_0001).unwrap();
+        const I_MASK_ADDRESS: u32 = 0x1f80_1074;
+        const VBLANK_IMASK_BIT: u32 = 1 << VBLANK_IRQ_LINE;
+        bus.write32(I_MASK_ADDRESS, VBLANK_IMASK_BIT).unwrap();
         for _ in 0..crate::bus::VBLANK_INTERVAL_TICKS {
             bus.tick();
         }
@@ -829,7 +856,16 @@ mod tests {
         cpu.step(&mut bus).unwrap();
 
         assert_eq!(cpu.state().pc, EXCEPTION_VECTOR);
-        assert_eq!(cpu.cop0[COP0_CAUSE], 1 << 8);
+        assert_eq!(cpu.cop0[COP0_EPC], INTERRUPTED_PC);
+        assert_eq!(
+            cpu.cop0[COP0_CAUSE],
+            VBLANK_IMASK_BIT << COP0_CAUSE_INTERRUPT_PENDING_SHIFT
+        );
+        assert_eq!(
+            cpu.cop0[COP0_STATUS],
+            (INITIAL_STATUS & !COP0_STATUS_EXCEPTION_STACK_MASK)
+                | ((INITIAL_STATUS << 2) & COP0_STATUS_EXCEPTION_STACK_MASK)
+        );
     }
 
     #[test]

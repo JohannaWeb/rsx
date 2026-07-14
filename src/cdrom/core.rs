@@ -39,6 +39,7 @@ const CDROM_IRQ_DATA_READY: u8 = 0x01;
 const CDROM_IRQ_COMPLETE: u8 = 0x02;
 const CDROM_IRQ_ACK: u8 = 0x03;
 const CDROM_ASYNC_DELAY_TICKS: u32 = 50_000;
+pub(crate) const CDROM_ACK_DELAY_TICKS: u32 = 2_000;
 const CDROM_GET_TN_FIRST_TRACK: u8 = 1;
 const CDROM_GET_TN_LAST_TRACK: u8 = 1;
 const CDROM_LEAD_OUT_TRACK: u8 = 0;
@@ -137,12 +138,28 @@ pub struct CdRomController {
     command_count: u64,
     dma_reads: u64,
     last_command: Option<CdRomCommand>,
-    // Queued second response delivered after the current interrupt is acknowledged
+    // First response (INT3 ack) delivered after CDROM_ACK_DELAY_TICKS, modeling
+    // real hardware's non-zero command-to-ack latency instead of asserting the
+    // interrupt synchronously within the register write.
+    pending_ack: Option<PendingAck>,
+    ack_ticks: u32,
+    // Queued second response delivered after the ack has been acknowledged.
     queued_irq: u8,
     queued_response: Vec<u8>,
-    queued_data: Vec<u8>,
     tick_counter: u32,
     mirrored_cd_command_count: u64,
+}
+
+// A second (INT1/INT2) response chained after the ack, for commands that
+// complete asynchronously (e.g. ReadN's data-ready, GetID's full response).
+struct PendingAckSecondStage {
+    irq: u8,
+    response: Vec<u8>,
+}
+
+struct PendingAck {
+    response: Vec<u8>,
+    second_stage: Option<PendingAckSecondStage>,
 }
 
 impl CdRomCommand {
@@ -374,9 +391,10 @@ impl CdRomController {
             command_count: 0,
             dma_reads: 0,
             last_command: None,
+            pending_ack: None,
+            ack_ticks: 0,
             queued_irq: 0,
             queued_response: Vec::new(),
-            queued_data: Vec::new(),
             tick_counter: 0,
             mirrored_cd_command_count: 0,
         }
@@ -444,6 +462,22 @@ impl CdRomController {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        if self.ack_ticks > 0 {
+            self.ack_ticks = self.ack_ticks.saturating_sub(cycles);
+            if self.ack_ticks == 0 {
+                if let Some(pending) = self.pending_ack.take() {
+                    self.response_fifo.clear();
+                    self.response_fifo.extend_from_slice(&pending.response);
+                    self.interrupt_flag = CDROM_IRQ_ACK;
+                    if let Some(second_stage) = pending.second_stage {
+                        self.queued_irq = second_stage.irq;
+                        self.queued_response = second_stage.response;
+                        self.tick_counter = CDROM_ASYNC_DELAY_TICKS;
+                    }
+                }
+            }
+        }
+
         if self.tick_counter > 0 {
             self.tick_counter = self.tick_counter.saturating_sub(cycles);
             if self.tick_counter == 0 && self.queued_irq != 0 {
@@ -452,20 +486,27 @@ impl CdRomController {
                     self.response_fifo.clear();
                     self.response_fifo
                         .extend_from_slice(&self.queued_response.clone());
-                    if !self.queued_data.is_empty() {
-                        self.data_fifo.clear();
-                        self.data_fifo.extend_from_slice(&self.queued_data.clone());
-                    }
                     self.interrupt_flag = self.queued_irq;
                     self.queued_irq = 0;
                     self.queued_response.clear();
-                    self.queued_data.clear();
                 } else {
                     // Try again next tick if still busy
                     self.tick_counter = 1;
                 }
             }
         }
+    }
+
+    // Stages the INT3 ack response (and optional chained second response,
+    // e.g. INT1/INT2) to be delivered after CDROM_ACK_DELAY_TICKS, rather than
+    // asserting the interrupt synchronously within the command's register write.
+    fn schedule_ack(&mut self, response: Vec<u8>, second_stage: Option<(u8, Vec<u8>)>) {
+        self.pending_ack = Some(PendingAck {
+            response,
+            second_stage: second_stage
+                .map(|(irq, response)| PendingAckSecondStage { irq, response }),
+        });
+        self.ack_ticks = CDROM_ACK_DELAY_TICKS;
     }
 
     pub fn sync_psyq_state(&mut self, ram: &mut [u8]) {
@@ -721,12 +762,7 @@ impl CdRomController {
         }
         // INT3 (ack) first, then INT1 (data ready) — data is pre-loaded into data_fifo
         let stat = self.status;
-        self.response_fifo.clear();
-        self.response_fifo.push(stat);
-        self.interrupt_flag = CDROM_IRQ_ACK;
-        self.queued_irq = CDROM_IRQ_DATA_READY;
-        self.queued_response = vec![stat];
-        self.tick_counter = CDROM_ASYNC_DELAY_TICKS;
+        self.schedule_ack(vec![stat], Some((CDROM_IRQ_DATA_READY, vec![stat])));
     }
 
     fn get_td(&mut self) {
@@ -762,14 +798,9 @@ impl CdRomController {
     fn get_id(&mut self) {
         // INT3 (ack) first with status only, then INT2 with the full 8-byte response
         let stat = self.status;
-        self.response_fifo.clear();
-        self.response_fifo.push(stat);
-        self.interrupt_flag = CDROM_IRQ_ACK;
-
-        self.queued_irq = CDROM_IRQ_COMPLETE;
-        self.queued_response = CDROM_GET_ID_RESPONSE.to_vec();
-        self.queued_response[0] = stat;
-        self.tick_counter = CDROM_ASYNC_DELAY_TICKS;
+        let mut response = CDROM_GET_ID_RESPONSE.to_vec();
+        response[0] = stat;
+        self.schedule_ack(vec![stat], Some((CDROM_IRQ_COMPLETE, response)));
     }
 
     fn complete_with_status(&mut self) {
@@ -779,14 +810,9 @@ impl CdRomController {
     // INT3 ack with [stat], then optionally a second response with irq2/bytes2
     fn push_ack_then(&mut self, second_bytes: &[u8], second_irq: u8) {
         log::debug!("CD-ROM ack INT3, queuing IRQ {second_irq} response: {second_bytes:02x?}");
-        self.response_fifo.clear();
-        self.response_fifo.push(self.status);
-        self.interrupt_flag = CDROM_IRQ_ACK;
-        if second_irq != 0 {
-            self.queued_irq = second_irq;
-            self.queued_response = second_bytes.to_vec();
-            self.tick_counter = CDROM_ASYNC_DELAY_TICKS;
-        }
+        let stat = self.status;
+        let second_stage = (second_irq != 0).then(|| (second_irq, second_bytes.to_vec()));
+        self.schedule_ack(vec![stat], second_stage);
     }
 
     fn push_response(&mut self, bytes: &[u8]) {
@@ -794,9 +820,7 @@ impl CdRomController {
             "CD-ROM response: {bytes:02x?} (interrupt {:#04x})",
             CDROM_IRQ_ACK
         );
-        self.response_fifo.clear();
-        self.response_fifo.extend_from_slice(bytes);
-        self.interrupt_flag = CDROM_IRQ_ACK;
+        self.schedule_ack(bytes.to_vec(), None);
     }
 }
 
@@ -1024,6 +1048,7 @@ mod tests {
 
         cdrom.write8(CDROM_INDEX_ADDRESS, 0);
         cdrom.write8(CDROM_RESPONSE_ADDRESS, CdRomCommand::GetStat.code());
+        cdrom.tick(CDROM_ACK_DELAY_TICKS);
 
         assert_ne!(
             cdrom.read8(CDROM_INDEX_ADDRESS) & CDROM_STATUS_RESPONSE_FIFO_HAS_DATA_BIT,
@@ -1056,9 +1081,11 @@ mod tests {
         cdrom.write8(CDROM_PARAMETER_ADDRESS, CDROM_STATUS_STANDBY);
         cdrom.write8(CDROM_PARAMETER_ADDRESS, CDROM_IRQ_DATA_READY);
         cdrom.write8(CDROM_RESPONSE_ADDRESS, CdRomCommand::Setloc.code());
+        cdrom.tick(CDROM_ACK_DELAY_TICKS);
         assert_eq!(cdrom.read8(CDROM_RESPONSE_ADDRESS), CDROM_STATUS_STANDBY);
 
         cdrom.write8(CDROM_RESPONSE_ADDRESS, CdRomCommand::ReadN.code());
+        cdrom.tick(CDROM_ACK_DELAY_TICKS);
         assert_eq!(
             cdrom.read8(CDROM_RESPONSE_ADDRESS),
             CDROM_STATUS_STANDBY | CDROM_STATUS_READING
