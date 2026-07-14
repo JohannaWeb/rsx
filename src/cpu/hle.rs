@@ -1,4 +1,7 @@
-use super::{BiosCallVector, COP0_STATUS, Cpu, InterruptHook, exception_vector};
+use super::{
+    BiosCallVector, COP0_CAUSE, COP0_EPC, COP0_STATUS, COP0_STATUS_EXCEPTION_STACK_MASK, Cpu,
+    InterruptHook, exception_vector,
+};
 use crate::bus::Bus as CpuBusAccess;
 
 const BIOS_A_MALLOC: u32 = 0x33;
@@ -156,10 +159,11 @@ impl BiosHle {
                 cpu.regs[31]
             );
         }
-        cpu.cop0[12] = pc;
-        cpu.cop0[13] = cause;
+        cpu.cop0[COP0_EPC] = pc;
+        cpu.cop0[COP0_CAUSE] = cause;
         let status = cpu.cop0[COP0_STATUS];
-        cpu.cop0[COP0_STATUS] = (status & !0x3f) | ((status << 2) & 0x3f);
+        cpu.cop0[COP0_STATUS] = (status & !COP0_STATUS_EXCEPTION_STACK_MASK)
+            | ((status << 2) & COP0_STATUS_EXCEPTION_STACK_MASK);
         if let Some(hook) = self.interrupt_hook {
             self.interrupt_saved_registers = Some((cpu.regs, cpu.hi, cpu.lo));
             cpu.regs[16..24].copy_from_slice(&hook.saved);
@@ -258,8 +262,6 @@ impl BiosHle {
     }
 
     fn return_from_exception(&mut self, cpu: &mut Cpu) {
-        const COP0_STATUS_EXCEPTION_STACK_MASK: u32 = 0x3f;
-        const COP0_EPC: usize = 14;
         let status = cpu.cop0[COP0_STATUS];
         cpu.cop0[COP0_STATUS] = (status & !COP0_STATUS_EXCEPTION_STACK_MASK)
             | ((status >> 2) & (COP0_STATUS_EXCEPTION_STACK_MASK >> 2));
